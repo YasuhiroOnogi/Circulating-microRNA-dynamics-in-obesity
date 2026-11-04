@@ -1,0 +1,242 @@
+---
+title: "04.3.1 Pathway module × enrichment join (04_GO_KEGG × 04.3_pathway_network)"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.height = 6, fig.width = 10, dpi = 150)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(openxlsx)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd_mirna, "output", "04.3.1_pathway_module_enrichment_join", date_str)
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("Output:", dir_output, "\n")
+```
+
+# 3. Load data
+
+```{r helpers}
+find_latest_dated_dir <- function(base) {
+  dirs  <- list.dirs(base, full.names = TRUE, recursive = FALSE)
+  dated <- sort(dirs[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(dirs))],
+                decreasing = TRUE)
+  if (length(dated) == 0) stop("No dated subdirectory under: ", base)
+  cat("Using:", dated[1], "\n")
+  dated[1]
+}
+```
+
+## 3a. Enrichment results from 04_GO_KEGG
+
+All `*_tissue_cluster_all.csv` files under all subdirectories of the latest dated dir.
+
+```{r load_enrichment}
+dir_gokegg <- find_latest_dated_dir(file.path(wd_mirna, "output", "04_GO_KEGG"))
+
+enrich_files <- list.files(dir_gokegg, pattern = "_tissue_cluster_all\\.csv$",
+                           full.names = TRUE, recursive = TRUE)
+
+cat("Found tissue_cluster_all CSV files:\n")
+for (f in enrich_files) cat(" ", basename(dirname(f)), "/", basename(f), "\n")
+
+enrichment_all <- bind_rows(lapply(enrich_files, function(f) {
+  db_label <- basename(dirname(f))   # subdirectory name: GO, KEGG, MSigDB, Reactome
+  read.csv(f, stringsAsFactors = FALSE) %>%
+    as_tibble() %>%
+    mutate(db_dir    = db_label,
+           tissue    = as.character(tissue),
+           miRNA_cluster = as.character(miRNA_cluster))
+}))
+
+cat("\nTotal enrichment rows loaded:", nrow(enrichment_all), "\n")
+cat("Databases (db_dir):\n")
+print(table(enrichment_all$db_dir))
+cat("Tissues:\n")
+print(table(enrichment_all$tissue))
+```
+
+## 3b. Pathway modules from 04.3
+
+```{r load_modules}
+dir_net <- find_latest_dated_dir(file.path(wd_mirna, "output", "04.3_pathway_network"))
+
+modules_df <- read.csv(file.path(dir_net, "pathway_modules_all_tissues.csv"),
+                       stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  mutate(tissue = as.character(tissue),
+         module = as.character(module))
+
+cat("Pathway modules rows:", nrow(modules_df), "\n")
+cat("Tissues:\n")
+print(table(modules_df$tissue))
+cat("Sources:\n")
+print(table(modules_df$source))
+```
+
+# 4. Parse node_id → pathway_id
+
+`node_id` format is `{source}|{pathway_ID}`. Extract the part after `|` as join key.
+
+```{r parse_node_id}
+modules_df <- modules_df %>%
+  mutate(pathway_id = sub("^[^|]+\\|", "", node_id))
+
+cat("Example node_id → pathway_id mapping:\n")
+modules_df %>%
+  distinct(source, node_id, pathway_id) %>%
+  group_by(source) %>%
+  slice_head(n = 2) %>%
+  print(n = Inf)
+```
+
+# 5. Join
+
+Left join: `modules_df` (base) ← `enrichment_all` on `pathway_id == ID` + `tissue == tissue`.
+Each module row retains all enrichment metadata where available.
+
+```{r join}
+joined_df <- modules_df %>%
+  left_join(
+    enrichment_all %>%
+      dplyr::select(ID, tissue, miRNA_cluster, GeneRatio, BgRatio,
+                    pvalue, enrich_p_adj = p.adjust, qvalue, geneID, Count, db_dir,
+                    any_of("msigdb_set")),
+    by = c("pathway_id" = "ID", "tissue" = "tissue")
+  )
+
+cat("=== Join result ===\n")
+cat("Rows in modules_df  :", nrow(modules_df), "\n")
+cat("Rows after join     :", nrow(joined_df), "\n")
+cat("Matched (non-NA miRNA_cluster):", sum(!is.na(joined_df$miRNA_cluster)), "\n")
+cat("Unmatched           :", sum(is.na(joined_df$miRNA_cluster)), "\n")
+```
+
+# 6. Diagnostics
+
+## 6a. Match rate per source
+
+```{r diag_source}
+joined_df %>%
+  group_by(source) %>%
+  summarise(
+    n_total   = n(),
+    n_matched = sum(!is.na(miRNA_cluster)),
+    pct_match = round(n_matched / n_total * 100, 1),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(n_total)) %>%
+  print(n = Inf)
+```
+
+## 6b. Match rate per tissue
+
+```{r diag_tissue}
+joined_df %>%
+  group_by(tissue) %>%
+  summarise(
+    n_total   = n(),
+    n_matched = sum(!is.na(miRNA_cluster)),
+    pct_match = round(n_matched / n_total * 100, 1),
+    .groups   = "drop"
+  ) %>%
+  arrange(tissue) %>%
+  print(n = Inf)
+```
+
+## 6c. Unmatched module pathways (top 30)
+
+```{r diag_unmatched}
+cat("=== Unmatched pathways (module pathway not found in enrichment CSVs) ===\n")
+joined_df %>%
+  filter(is.na(miRNA_cluster)) %>%
+  dplyr::select(tissue, source, node_id, Description, module) %>%
+  arrange(source, tissue) %>%
+  slice_head(n = 30) %>%
+  print(n = Inf)
+```
+
+## 6d. Module × miRNA cluster coverage
+
+```{r diag_module_cluster}
+cat("=== module_id × miRNA_cluster pairs ===\n")
+
+module_id_col <- if ("module_id" %in% names(joined_df)) "module_id" else "module"
+
+joined_df %>%
+  filter(!is.na(miRNA_cluster)) %>%
+  mutate(module_id_label = paste(tissue, "mod", .data[[module_id_col]], sep = "_")) %>%
+  count(tissue, module_id_label, miRNA_cluster) %>%
+  pivot_wider(names_from = miRNA_cluster, values_from = n, values_fill = 0L,
+              names_prefix = "cluster_") %>%
+  arrange(tissue, module_id_label) %>%
+  print(n = Inf)
+```
+
+# 7. Export
+
+```{r export}
+write.csv(joined_df,
+          file.path(dir_output, "pathway_module_enrichment_joined.csv"),
+          row.names = FALSE)
+cat("Saved: pathway_module_enrichment_joined.csv\n")
+
+# Summary: one row per tissue × module × miRNA_cluster
+summary_df <- joined_df %>%
+  filter(!is.na(miRNA_cluster)) %>%
+  group_by(tissue, module, source, miRNA_cluster) %>%
+  summarise(
+    n_pathways   = n(),
+    top_pathway  = Description[which.min(enrich_p_adj)],
+    min_p_adjust = min(enrich_p_adj, na.rm = TRUE),
+    .groups      = "drop"
+  ) %>%
+  arrange(tissue, module, source, miRNA_cluster)
+
+write.csv(summary_df,
+          file.path(dir_output, "pathway_module_cluster_summary.csv"),
+          row.names = FALSE)
+cat("Saved: pathway_module_cluster_summary.csv\n")
+
+cat("\n=== Summary table ===\n")
+print(summary_df, n = Inf)
+
+# Excel: tissue-wise sheets for joined_df
+wb <- createWorkbook()
+for (tis in sort(unique(joined_df$tissue))) {
+  addWorksheet(wb, tis)
+  writeData(wb, tis, joined_df %>% filter(tissue == tis))
+}
+saveWorkbook(wb,
+             file.path(dir_output, "pathway_module_enrichment_by_tissue.xlsx"),
+             overwrite = TRUE)
+cat("Saved: pathway_module_enrichment_by_tissue.xlsx\n")
+```
+
+# Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

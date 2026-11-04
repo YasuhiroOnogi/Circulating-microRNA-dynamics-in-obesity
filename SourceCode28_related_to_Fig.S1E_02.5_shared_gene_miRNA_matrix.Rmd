@@ -1,0 +1,222 @@
+---
+title: "Shared gene × miRNA matrix plot"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.dpi = 150)
+```
+
+# 1. Configuration
+
+```{r config}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+
+input_csv <- file.path(
+  wd_mirna,
+  "output/02_integration/2026-04-27/union/shared_gene_correspondence_long.csv"
+)
+union_csv <- file.path(
+  wd_mirna,
+  "output/02_integration/2026-04-27/union/negative_cosine_pairs_union.csv"
+)
+
+tissue_order <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+out_dir <- dirname(input_csv)
+
+stopifnot(file.exists(input_csv), file.exists(union_csv))
+cat("Input :", input_csv, "\n")
+cat("Output:", out_dir,   "\n")
+```
+
+# 2. Libraries
+
+```{r libraries}
+library(tidyverse)
+```
+
+# 3. Load and reshape data
+
+`miRNAs` column contains semicolon-separated miRNA names. Expand to one row
+per gene × tissue × miRNA, then summarise across tissues to gene × miRNA level.
+
+```{r load}
+raw <- read.csv(input_csv, stringsAsFactors = FALSE)
+cat("Raw rows:", nrow(raw), "  Unique genes:", n_distinct(raw$SYMBOL), "\n")
+
+# miRNA cluster lookup from union pairs
+mirna_lut <- read.csv(union_csv, stringsAsFactors = FALSE) %>%
+  distinct(miRNA_Name, miRNA_cluster) %>%
+  mutate(
+    miRNA_short   = sub("^mmu-", "", miRNA_Name),
+    miRNA_cluster = as.character(miRNA_cluster)
+  )
+
+# Expand semicolon-separated miRNAs
+long <- raw %>%
+  mutate(miRNA_list = strsplit(miRNAs, ";")) %>%
+  unnest(miRNA_list) %>%
+  mutate(
+    miRNA_short = sub("^mmu-", "", trimws(miRNA_list)),
+    tissue      = factor(tissue, levels = tissue_order)
+  )
+
+cat("Expanded rows:", nrow(long), "\n")
+cat("Unique miRNAs:", n_distinct(long$miRNA_short), "\n")
+```
+
+# 4. Build gene × miRNA summary matrix
+
+For each gene–miRNA pair, compute:
+
+- `tissues_str`: tissue labels concatenated
+- `cosine_med`: median of `cosine_median` across tissues
+
+```{r matrix}
+mat_df <- long %>%
+  group_by(SYMBOL, miRNA_short) %>%
+  summarise(
+    tissues_str = paste(sort(unique(as.character(tissue))), collapse = ";"),
+    cosine_med  = median(cosine_median, na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  left_join(mirna_lut %>% dplyr::select(miRNA_short, miRNA_cluster),
+            by = "miRNA_short")
+
+cat("Matrix rows (gene x miRNA pairs):", nrow(mat_df), "\n")
+print(mat_df, n = Inf)
+```
+
+# 5. Determine axis order
+
+Genes ordered alphabetically. miRNAs ordered by miRNA_cluster (ascending),
+then n_pairs (total pairs in union) descending within cluster — matching the S4f convention.
+
+```{r axis-order}
+# Gene order: alphabetical
+gene_order <- sort(unique(mat_df$SYMBOL))
+
+# miRNA order: cluster asc, then total pairs desc (S4f convention)
+mirna_npairs <- read.csv(union_csv, stringsAsFactors = FALSE) %>%
+  mutate(miRNA_short = sub("^mmu-", "", miRNA_Name)) %>%
+  count(miRNA_short, miRNA_cluster, name = "n_pairs") %>%
+  mutate(miRNA_cluster = factor(as.character(miRNA_cluster),
+                                levels = as.character(sort(unique(as.integer(
+                                  as.character(miRNA_cluster))))))) %>%
+  arrange(miRNA_cluster, desc(n_pairs))
+
+mirna_order <- mirna_npairs %>%
+  filter(miRNA_short %in% mat_df$miRNA_short) %>%
+  pull(miRNA_short)
+
+cat("Gene order  :", paste(gene_order,  collapse = ", "), "\n")
+cat("miRNA order :", paste(mirna_order, collapse = ", "), "\n")
+```
+
+# 6. Binary presence/absence matrix
+
+Filled cell = gene–miRNA pair detected; empty cell = not detected.
+miRNA clusters separated by vertical lines.
+
+```{r binary-plot, fig.width=10, fig.height=7}
+# Expand to full gene × miRNA grid; absent pairs get detected = 0
+plot_df <- mat_df %>%
+  mutate(detected = 1L) %>%
+  complete(SYMBOL = gene_order, miRNA_short = mirna_order,
+           fill = list(detected = 0L)) %>%
+  mutate(
+    SYMBOL      = factor(SYMBOL,      levels = rev(gene_order)),
+    miRNA_short = factor(miRNA_short, levels = mirna_order),
+    detected    = factor(detected,    levels = c(0L, 1L))
+  )
+
+# miRNA cluster boundary positions (x-axis)
+mirna_seq <- tibble(miRNA_short = mirna_order) %>%
+  left_join(mirna_npairs %>% dplyr::select(miRNA_short, miRNA_cluster),
+            by = "miRNA_short") %>%
+  mutate(pos = row_number(), miRNA_cluster = as.character(miRNA_cluster))
+
+mirna_bounds <- mirna_seq %>%
+  group_by(miRNA_cluster) %>%
+  summarise(last_pos = max(pos), .groups = "drop") %>%
+  arrange(miRNA_cluster) %>%
+  slice(-n()) %>%
+  pull(last_pos) + 0.5
+
+mirna_mids <- mirna_seq %>%
+  group_by(miRNA_cluster) %>%
+  summarise(mid = mean(pos), .groups = "drop") %>%
+  arrange(miRNA_cluster)
+
+n_mirna <- length(mirna_order)
+n_gene  <- length(gene_order)
+
+p_bin <- ggplot(plot_df,
+                aes(x = miRNA_short, y = SYMBOL, fill = detected)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_vline(xintercept = mirna_bounds, color = "grey30", linewidth = 0.6) +
+  # miRNA cluster labels (top)
+  annotate("text",
+           x = mirna_mids$mid, y = n_gene + 0.8,
+           label = paste0("C", mirna_mids$miRNA_cluster),
+           size = 3, fontface = "bold", color = "grey20") +
+  scale_fill_manual(values = c("0" = "#F0F0F0", "1" = "#2C7BB6"),
+                    name = "Detected",
+                    labels = c("0" = "No", "1" = "Yes")) +
+  coord_fixed(clip = "off") +
+  labs(
+    title = "Shared target genes × miRNA — presence/absence",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.margin     = margin(5, 20, 5, 5),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y     = element_text(size = 9, face = "italic"),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+print(p_bin)
+
+# Dynamic ggsave dimensions
+cell_in <- 0.5
+fig_w   <- n_mirna * cell_in + 3.5
+fig_h   <- n_gene  * cell_in + 2.5
+
+ggsave(file.path(out_dir, "shared_gene_miRNA_matrix.svg"),
+       p_bin, width = fig_w, height = fig_h, limitsize = FALSE)
+ggsave(file.path(out_dir, "shared_gene_miRNA_matrix.png"),
+       p_bin, width = fig_w, height = fig_h, dpi = 300, limitsize = FALSE)
+cat(sprintf("Saved: shared_gene_miRNA_matrix.svg / .png  (%.1f x %.1f in)\n",
+            fig_w, fig_h))
+```
+
+# 7. Summary table
+
+```{r summary}
+mat_df %>%
+  arrange(SYMBOL, miRNA_cluster, miRNA_short) %>%
+  dplyr::select(SYMBOL, miRNA_cluster, miRNA_short, tissues_str, cosine_med) %>%
+  print(n = Inf)
+
+write.csv(mat_df,
+          file.path(out_dir, "shared_gene_miRNA_matrix.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: shared_gene_miRNA_matrix.csv\n")
+```
+
+```{r sessioninfo, echo=FALSE}
+writeLines(capture.output(sessionInfo()),
+           file.path(out_dir,
+                     paste0("sessioninfo_matrix_", Sys.Date(), ".txt")))
+```

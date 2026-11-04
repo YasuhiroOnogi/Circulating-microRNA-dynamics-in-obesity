@@ -1,0 +1,402 @@
+---
+title: "GSE155096 — Mouse maSigPro miRNA homologs: C vs T comparison"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.height = 5, fig.width = 8, dpi = 150)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna  <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+dir_ref   <- "F:/wd/cohort7_miRNAs/ref"
+gse_path  <- "F:/wd/deposit_dataset/GSE155096_MetS_microRNA_NGS.txt/GSE155096_MetS_microRNA_NGS.txt"
+dir_out   <- "F:/wd/cohort7_miRNAs/external validation/output/02_GSE155096_homolog"
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+homolog_tsv <- file.path(dir_ref, "TargetScan_v8.0",
+                         "homologous_miRNA_mmu_hsa.txt")
+
+# Auto-detect latest miRNA maSigPro output directory
+find_mirna_masigpro_dir <- function() {
+  base <- file.path(wd_mirna, "output", "01_maSigPro")
+  all_dated <- sort(list.dirs(base, full.names = TRUE, recursive = FALSE),
+                    decreasing = TRUE)
+  for (d in all_dated) {
+    if (length(list.files(d, pattern = "^Plasma_miRNA_ids_clst_")) > 0) return(d)
+  }
+  stop("miRNA maSigPro output not found")
+}
+
+dir_masigpro <- find_mirna_masigpro_dir()
+
+cat("maSigPro dir:", dir_masigpro, "\n")
+cat("Homolog file:", homolog_tsv,  "\n")
+cat("GSE155096   :", gse_path,     "\n")
+cat("Output dir  :", dir_out,      "\n")
+```
+
+# 3. Load mouse maSigPro miRNAs
+
+```{r load-mouse-mirna}
+mouse_mirna <- lapply(1:5, function(i) {
+  f <- file.path(dir_masigpro, paste0("Plasma_miRNA_ids_clst_", i, ".csv"))
+  read.csv(f, stringsAsFactors = FALSE)
+}) %>%
+  bind_rows() %>%
+  dplyr::rename(mmu_miRNA = miRNA_Name, miRNA_cluster = cluster)
+
+cat("Mouse maSigPro miRNAs:", nrow(mouse_mirna), "\n")
+print(table(mouse_mirna$miRNA_cluster))
+```
+
+# 4. Load homology table (TargetScan v8.0, mmu × hsa)
+
+```{r load-homolog}
+homolog_raw <- read.delim(homolog_tsv, header = TRUE,
+                          stringsAsFactors = FALSE, check.names = FALSE)
+
+# Expand to one row per mmu miRNA × hsa miRNA pair
+homolog_pairs <- homolog_raw %>%
+  filter(mmu_n_miRNA > 0, hsa_n_miRNA > 0) %>%
+  rowwise() %>%
+  mutate(
+    mmu_list = list(trimws(strsplit(mmu_MiRBase_IDs, ";")[[1]])),
+    hsa_list = list(trimws(strsplit(hsa_MiRBase_IDs, ";")[[1]]))
+  ) %>%
+  ungroup() %>%
+  unnest(mmu_list) %>%
+  unnest(hsa_list) %>%
+  dplyr::select(
+    miR_family       = `miR family`,
+    seed             = `Seed+m8`,
+    conservation     = `Family Conservation?`,
+    mmu_miRNA        = mmu_list,
+    hsa_miRNA        = hsa_list
+  ) %>%
+  filter(mmu_miRNA != "", hsa_miRNA != "")
+
+cat("Homologous pairs (mmu × hsa):", nrow(homolog_pairs), "\n")
+cat("Unique mouse miRNAs:", n_distinct(homolog_pairs$mmu_miRNA), "\n")
+cat("Unique human miRNAs:", n_distinct(homolog_pairs$hsa_miRNA), "\n")
+```
+
+# 5. Load GSE155096 human miRNA data
+
+```{r load-gse}
+gse_raw <- read.delim(gse_path, header = TRUE, check.names = FALSE,
+                      stringsAsFactors = FALSE)
+
+id_col  <- colnames(gse_raw)[1]
+samples <- colnames(gse_raw)[-1]
+
+# Sample group annotation
+sample_meta <- tibble(sample = samples) %>%
+  mutate(group = case_when(
+    grepl("^C", sample) ~ "Control",
+    grepl("^T", sample) ~ "Treatment",
+    TRUE                ~ "Other"
+  ))
+
+cat("Human miRNA features:", nrow(gse_raw), "\n")
+cat("Samples:", paste(samples, collapse = ", "), "\n")
+```
+
+# 6. Match: mouse maSigPro miRNAs → human homologs
+
+```{r match-homologs}
+# Join maSigPro miRNAs with homology table
+matched <- mouse_mirna %>%
+  inner_join(homolog_pairs, by = "mmu_miRNA") %>%
+  dplyr::select(mmu_miRNA, miRNA_cluster, miR_family,
+                seed, conservation, hsa_miRNA)
+
+cat("Mouse maSigPro miRNAs with human homologs:", n_distinct(matched$mmu_miRNA), "\n")
+cat("Corresponding human miRNAs              :", n_distinct(matched$hsa_miRNA), "\n")
+
+# Filter to human miRNAs present in GSE155096
+hsa_in_gse <- unique(gse_raw[[id_col]])
+matched_in_gse <- matched %>%
+  filter(hsa_miRNA %in% hsa_in_gse)
+
+cat("\nHuman miRNAs found in GSE155096:", n_distinct(matched_in_gse$hsa_miRNA), "\n")
+cat("Corresponding mouse miRNAs      :", n_distinct(matched_in_gse$mmu_miRNA), "\n")
+
+print(as_tibble(matched_in_gse), n = Inf)
+
+write.csv(matched_in_gse,
+          file.path(dir_out, "homolog_pairs_matched_in_GSE155096.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: homolog_pairs_matched_in_GSE155096.csv\n")
+```
+
+# 7. Extract and reshape expression of matched human miRNAs
+
+```{r extract-expr}
+target_hsa <- unique(matched_in_gse$hsa_miRNA)
+
+# Average duplicate miRNA rows (same ID appearing multiple times)
+gse_filtered <- gse_raw %>%
+  filter(.data[[id_col]] %in% target_hsa) %>%
+  group_by(.data[[id_col]]) %>%
+  summarise(across(all_of(samples), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop") %>%
+  dplyr::rename(hsa_miRNA = 1)
+
+cat("Human miRNAs extracted:", nrow(gse_filtered), "\n")
+
+# Long format with group annotation
+expr_long <- gse_filtered %>%
+  pivot_longer(-hsa_miRNA, names_to = "sample", values_to = "expr") %>%
+  left_join(sample_meta, by = "sample") %>%
+  mutate(
+    log2expr = log2(expr + 1),
+    group    = factor(group, levels = c("Control", "Treatment"))
+  ) %>%
+  left_join(
+    matched_in_gse %>% distinct(hsa_miRNA, mmu_miRNA, miRNA_cluster,
+                                miR_family, conservation),
+    by = "hsa_miRNA"
+  )
+```
+
+# 8. C vs T statistical comparison
+
+```{r stats-cvsT}
+# Wilcoxon rank-sum test per human miRNA (log2-scale)
+stats_res <- expr_long %>%
+  group_by(hsa_miRNA, mmu_miRNA, miRNA_cluster, miR_family, conservation) %>%
+  summarise(
+    mean_C  = mean(log2expr[group == "Control"],   na.rm = TRUE),
+    mean_T  = mean(log2expr[group == "Treatment"], na.rm = TRUE),
+    log2FC  = mean_T - mean_C,
+    p_value = tryCatch(
+      wilcox.test(log2expr[group == "Control"],
+                  log2expr[group == "Treatment"],
+                  exact = FALSE)$p.value,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj     = p.adjust(p_value, method = "BH"),
+    sig       = case_when(
+      p_adj < 0.05 ~ "FDR < 0.05",
+      p_value < 0.05 ~ "p < 0.05",
+      TRUE           ~ "n.s."
+    ),
+    direction = if_else(log2FC > 0, "Up in T", "Down in T")
+  ) %>%
+  arrange(p_value)
+
+cat("Statistical results:\n")
+print(as_tibble(stats_res), n = Inf)
+
+write.csv(stats_res,
+          file.path(dir_out, "CvsT_stats.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: CvsT_stats.csv\n")
+```
+
+# 9. Visualization
+
+## 9a. Boxplots — all matched miRNAs
+
+```{r boxplots, results='asis', fig.height=4, fig.width=5}
+MIRNA_CLUSTER_COLORS <- c(
+  "1" = "#B3E2CD", "2" = "#FDCDAC", "3" = "#CBD5E8",
+  "4" = "#F4CAE4", "5" = "#FFF2AE"
+)
+
+for (hsa in unique(stats_res$hsa_miRNA)) {
+
+  row_stat <- stats_res %>% filter(hsa_miRNA == hsa)
+  mmu_label <- paste(unique(row_stat$mmu_miRNA), collapse = "; ")
+  clst_label <- paste(unique(row_stat$miRNA_cluster), collapse = "/")
+  clst_col   <- MIRNA_CLUSTER_COLORS[as.character(row_stat$miRNA_cluster[1])]
+
+  df_plot <- expr_long %>% filter(hsa_miRNA == hsa)
+
+  p <- ggplot(df_plot, aes(x = group, y = log2expr, fill = group)) +
+    geom_boxplot(outlier.shape = NA, width = 0.5,
+                 linewidth = 0.6, alpha = 0.8) +
+    geom_jitter(width = 0.12, size = 2.0, alpha = 0.9,
+                color = "grey20") +
+    scale_fill_manual(values = c("Control" = "#9ecae1",
+                                 "Treatment" = "#fc9272"),
+                      guide = "none") +
+    annotate("text", x = 1.5, y = max(df_plot$log2expr) * 1.05,
+             label = paste0("p = ", signif(row_stat$p_value, 2),
+                            "  |  FDR = ", signif(row_stat$p_adj, 2),
+                            "\nlog2FC = ", round(row_stat$log2FC, 2)),
+             size = 3.2, hjust = 0.5, color = "grey20") +
+    labs(
+      title    = hsa,
+      subtitle = paste0("Mouse homolog: ", mmu_label,
+                        "  |  Cluster ", clst_label),
+      x = NULL, y = "log2(1 + expression)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title    = element_text(face = "bold", hjust = 0.5,
+                                   color = clst_col),
+      plot.subtitle = element_text(size = 9, color = "grey40",
+                                   hjust = 0.5),
+      panel.grid.major.x = element_blank()
+    )
+
+  cat("\n\n###", hsa, "\n\n")
+  print(p)
+
+  ggsave(file.path(dir_out,
+                   paste0("boxplot_CvsT_", gsub("[:/]", "_", hsa), ".svg")),
+         p, width = 5, height = 4)
+}
+```
+
+## 9b. Summary: log2FC ranked plot
+
+```{r fc-plot, fig.height=5, fig.width=8}
+# Deduplicate by hsa_miRNA: one hsa miRNA may map to multiple mouse miRNAs/clusters
+# Keep the mouse cluster with the smallest cluster number for coloring
+plot_fc <- stats_res %>%
+  group_by(hsa_miRNA) %>%
+  slice_min(order_by = miRNA_cluster, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(log2FC) %>%
+  mutate(
+    hsa_short     = sub("^hsa-", "", hsa_miRNA),
+    hsa_short     = factor(hsa_short, levels = unique(hsa_short)),
+    miRNA_cluster = factor(as.character(miRNA_cluster), levels = 1:5)
+  )
+
+p_fc <- ggplot(plot_fc,
+               aes(x = hsa_short, y = log2FC, fill = miRNA_cluster)) +
+  geom_col(width = 0.7, color = "white", linewidth = 0.3) +
+  geom_point(aes(shape = sig), size = 3, color = "grey20", fill = NA) +
+  scale_fill_manual(name = "Mouse\ncluster",
+                    values = MIRNA_CLUSTER_COLORS) +
+  scale_shape_manual(name = "Significance",
+                     values = c("FDR < 0.05" = 8,
+                                "p < 0.05"   = 21,
+                                "n.s."        = 32)) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.5) +
+  labs(
+    title    = "C vs T log2 fold change — human homologs of mouse maSigPro miRNAs",
+    subtitle = "Ranked by log2FC (Treatment / Control)",
+    x = NULL, y = "log2FC (Treatment \u2212 Control)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(color = "grey40", hjust = 0.5),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 9),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+print(p_fc)
+
+ggsave(file.path(dir_out, "log2FC_ranked.svg"), p_fc, width = 8, height = 5)
+ggsave(file.path(dir_out, "log2FC_ranked.png"), p_fc, width = 8, height = 5,
+       dpi = 300)
+cat("Saved: log2FC_ranked.svg / .png\n")
+```
+
+## 9c. Heatmap: matched miRNA expression across samples
+
+```{r heatmap, fig.height=6, fig.width=7}
+# Wide matrix: miRNA × sample (log2 scale)
+mat <- gse_filtered %>%
+  column_to_rownames("hsa_miRNA") %>%
+  mutate(across(everything(), ~ log2(.x + 1))) %>%
+  as.matrix()
+
+# Order rows by log2FC (deduplicate: one row per hsa_miRNA)
+row_order <- stats_res %>%
+  group_by(hsa_miRNA) %>%
+  slice_min(order_by = miRNA_cluster, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(log2FC) %>%
+  pull(hsa_miRNA) %>%
+  unique()
+row_order <- row_order[row_order %in% rownames(mat)]
+mat <- mat[row_order, , drop = FALSE]
+
+# Cluster annotation for rows
+row_ann <- stats_res %>%
+  dplyr::select(hsa_miRNA, miRNA_cluster) %>%
+  distinct() %>%
+  filter(hsa_miRNA %in% rownames(mat)) %>%
+  arrange(match(hsa_miRNA, rownames(mat)))
+
+mat_long <- as.data.frame(mat) %>%
+  rownames_to_column("hsa_miRNA") %>%
+  pivot_longer(-hsa_miRNA, names_to = "sample", values_to = "log2expr") %>%
+  left_join(sample_meta, by = "sample") %>%
+  left_join(stats_res %>% dplyr::select(hsa_miRNA, miRNA_cluster, log2FC,
+                                         p_value, sig),
+            by = "hsa_miRNA") %>%
+  mutate(
+    hsa_short = sub("^hsa-", "", hsa_miRNA),
+    hsa_short = factor(hsa_short,
+                       levels = sub("^hsa-", "", row_order)),
+    sample    = factor(sample, levels = samples)
+  )
+
+p_heat <- ggplot(mat_long,
+                 aes(x = sample, y = hsa_short, fill = log2expr)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  scale_fill_gradient2(
+    low  = "#2166ac", mid = "white", high = "#d6604d",
+    midpoint = median(mat_long$log2expr, na.rm = TRUE),
+    name = "log2(1+expr)"
+  ) +
+  geom_vline(xintercept = sum(sample_meta$group == "Control") + 0.5,
+             color = "grey30", linewidth = 0.8, linetype = "dashed") +
+  annotate("text", x = sum(sample_meta$group == "Control") / 2 + 0.2,
+           y = nrow(mat) + 0.7, label = "Control", size = 3.5,
+           fontface = "bold", color = "#2166ac") +
+  annotate("text",
+           x = sum(sample_meta$group == "Control") +
+             sum(sample_meta$group == "Treatment") / 2 + 0.5,
+           y = nrow(mat) + 0.7, label = "Treatment", size = 3.5,
+           fontface = "bold", color = "#d6604d") +
+  labs(
+    title    = "Human homolog miRNA expression — GSE155096",
+    subtitle = "Rows ordered by log2FC (low \u2192 high); log2(1+x) scale",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(color = "grey40", hjust = 0.5, size = 9),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    axis.text.y     = element_text(face = "italic", size = 9),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+print(p_heat)
+
+ggsave(file.path(dir_out, "heatmap_homolog_expression.svg"),
+       p_heat, width = 7, height = max(4, nrow(mat) * 0.45 + 2))
+ggsave(file.path(dir_out, "heatmap_homolog_expression.png"),
+       p_heat, width = 7, height = max(4, nrow(mat) * 0.45 + 2), dpi = 300)
+cat("Saved: heatmap_homolog_expression.svg / .png\n")
+```

@@ -1,0 +1,390 @@
+---
+title: "Pathway similarity network — Jaccard-based module clustering per tissue"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.height = 12,
+  fig.width  = 14,
+  dpi        = 150
+)
+```
+
+# 1. Libraries
+
+Required packages (install if missing):
+`install.packages(c("igraph", "ggraph", "tidygraph", "ggforce", "RColorBrewer", "scales"))`
+
+```{r libraries}
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(ggforce)
+library(RColorBrewer)
+library(scales)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+
+tissues <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+# Minimum Jaccard index to draw an edge between two pathways
+JACCARD_THRESHOLD <- 0.1
+
+# Maximum pathways per tissue (top by p.adjust) to keep the network readable
+MAX_PATHWAYS <- 150
+
+# Number of top nodes per module to annotate with pathway labels
+LABEL_TOP_N <- 3
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd_mirna, "output", "04.3_pathway_network", date_str)
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory:", dir_output, "\n")
+
+# Database color palette
+source_colors <- c(
+  "GO BP"                  = "#4DAF4A",
+  "KEGG"                   = "#E41A1C",
+  "Reactome"               = "#984EA3",
+  "MSigDB:Hallmark"        = "#FF7F00",
+  "MSigDB:C2_KEGG"         = "#A65628",
+  "MSigDB:C2_Reactome"     = "#F781BF",
+  "MSigDB:C2_WikiPathways" = "#999999"
+)
+```
+
+# 3. Load pathway results from 04_GO_KEGG output
+
+```{r find_input}
+find_latest_dated_dir <- function(base) {
+  dirs  <- list.dirs(base, full.names = TRUE, recursive = FALSE)
+  dated <- sort(
+    dirs[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(dirs))],
+    decreasing = TRUE
+  )
+  if (length(dated) == 0) stop("No dated subdirectory found under: ", base)
+  cat("Using pathway results from:", dated[1], "\n")
+  dated[1]
+}
+
+base_04   <- file.path(wd_mirna, "output", "04_GO_KEGG")
+input_dir <- find_latest_dated_dir(base_04)
+```
+
+```{r load_csv}
+safe_read <- function(path) {
+  if (!file.exists(path)) {
+    cat("File not found — skipped:", basename(path), "\n")
+    return(NULL)
+  }
+  df <- read.csv(path, stringsAsFactors = FALSE)
+  cat("Loaded", nrow(df), "rows from:", basename(path), "\n")
+  df
+}
+
+go_bp_all    <- safe_read(file.path(input_dir, "GO",       "GO_BP_tissue_cluster_all.csv"))
+kegg_all     <- safe_read(file.path(input_dir, "KEGG",     "KEGG_tissue_cluster_all.csv"))
+msigdb_all   <- safe_read(file.path(input_dir, "MSigDB",   "MSigDB_tissue_cluster_all.csv"))
+reactome_all <- safe_read(file.path(input_dir, "Reactome", "Reactome_tissue_cluster_all.csv"))
+```
+
+```{r combine_databases}
+# Standardise to: tissue, miRNA_cluster, ID, Description, p.adjust, geneID, source
+add_source <- function(df, src) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  df %>%
+    dplyr::select(tissue, miRNA_cluster, ID, Description, p.adjust, geneID) %>%
+    mutate(source        = src,
+           miRNA_cluster = as.character(miRNA_cluster))
+}
+
+msigdb_rows <- if (!is.null(msigdb_all) && nrow(msigdb_all) > 0) {
+  bind_rows(lapply(unique(msigdb_all$msigdb_set), function(s) {
+    add_source(
+      msigdb_all %>%
+        filter(msigdb_set == s) %>%
+        dplyr::select(tissue, miRNA_cluster, ID, Description, p.adjust, geneID),
+      paste0("MSigDB:", s)
+    )
+  }))
+} else NULL
+
+all_pathways <- bind_rows(
+  add_source(go_bp_all,    "GO BP"),
+  add_source(kegg_all,     "KEGG"),
+  add_source(reactome_all, "Reactome"),
+  msigdb_rows
+) %>%
+  filter(!is.na(geneID), geneID != "")
+
+cat("\nTotal pathway entries:", nrow(all_pathways), "\n")
+cat("Tissues:", paste(sort(unique(all_pathways$tissue)), collapse = ", "), "\n")
+cat("Sources:", paste(sort(unique(all_pathways$source)), collapse = ", "), "\n")
+```
+
+# 4. Jaccard index functions
+
+```{r jaccard_functions}
+# Parse "/" separated gene symbols from geneID column
+parse_gene_set <- function(gene_str) {
+  if (is.na(gene_str) || gene_str == "") return(character(0))
+  unique(trimws(unlist(strsplit(as.character(gene_str), "/"))))
+}
+
+# Jaccard similarity: |A ∩ B| / |A ∪ B|
+jaccard_index <- function(a, b) {
+  if (length(a) == 0 || length(b) == 0) return(0)
+  length(intersect(a, b)) / length(union(a, b))
+}
+
+# Compute all pairwise Jaccard edges above threshold
+# Returns tibble: from, to, jaccard
+compute_jaccard_edges <- function(node_ids, gene_lists, threshold) {
+  n     <- length(node_ids)
+  edges <- vector("list", n * (n - 1L) / 2L)
+  k     <- 0L
+  for (i in seq_len(n - 1L)) {
+    for (j in (i + 1L):n) {
+      jv <- jaccard_index(gene_lists[[i]], gene_lists[[j]])
+      if (jv >= threshold) {
+        k         <- k + 1L
+        edges[[k]] <- list(from = node_ids[i], to = node_ids[j], jaccard = jv)
+      }
+    }
+  }
+  if (k == 0L) return(tibble(from = character(), to = character(), jaccard = numeric()))
+  bind_rows(edges[seq_len(k)])
+}
+```
+
+# 5. Network construction, Louvain module detection, and visualization per tissue
+
+```{r network_per_tissue, results="asis", fig.height=12, fig.width=14}
+all_module_tables <- list()
+
+for (tis in tissues) {
+  cat("\n\n##", tis, "\n\n")
+
+  # One node per unique (source, ID): keep entry with smallest p.adjust
+  tis_df <- all_pathways %>%
+    filter(tissue == tis) %>%
+    group_by(source, ID) %>%
+    slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+  if (nrow(tis_df) < 2) {
+    cat("Too few pathways (", nrow(tis_df), ") — skipped.\n\n")
+    next
+  }
+
+  if (nrow(tis_df) > MAX_PATHWAYS) {
+    tis_df <- tis_df %>% slice_min(p.adjust, n = MAX_PATHWAYS, with_ties = FALSE)
+    cat("Trimmed to top", MAX_PATHWAYS, "pathways by p.adjust.\n")
+  }
+
+  tis_df <- tis_df %>%
+    mutate(
+      node_id   = paste0(source, "|", ID),
+      neg_log_p = pmin(-log10(pmax(p.adjust, 1e-10)), 10)
+    )
+
+  gene_lists <- lapply(tis_df$geneID, parse_gene_set)
+  edges      <- compute_jaccard_edges(tis_df$node_id, gene_lists, JACCARD_THRESHOLD)
+
+  cat("Pathways:", nrow(tis_df),
+      "| Edges (J >=", JACCARD_THRESHOLD, "):", nrow(edges), "\n")
+
+  if (nrow(edges) == 0) {
+    cat("No edges above threshold — network plot skipped.\n\n")
+    next
+  }
+
+  # Build igraph object
+  verts <- tis_df %>%
+    dplyr::select(name = node_id, Description, source, p.adjust,
+                  neg_log_p, miRNA_cluster)
+
+  g <- graph_from_data_frame(edges, directed = FALSE, vertices = verts)
+
+  # Louvain community detection weighted by Jaccard index
+  set.seed(42)
+  comm        <- cluster_louvain(g, weights = E(g)$jaccard)
+  V(g)$module <- as.character(membership(comm))
+  n_mods      <- max(membership(comm))
+  cat("Louvain modules:", n_mods, "\n")
+
+  # Store module membership
+  mod_tbl <- tibble(
+    tissue      = tis,
+    node_id     = V(g)$name,
+    Description = V(g)$Description,
+    source      = V(g)$source,
+    p.adjust    = V(g)$p.adjust,
+    module      = V(g)$module
+  )
+  all_module_tables[[tis]] <- mod_tbl
+
+  write.csv(
+    edges %>% mutate(tissue = tis),
+    file.path(dir_output, paste0("jaccard_edges_", tis, ".csv")),
+    row.names = FALSE
+  )
+  write.csv(
+    mod_tbl,
+    file.path(dir_output, paste0("module_membership_", tis, ".csv")),
+    row.names = FALSE
+  )
+
+  # ── Layout & plot ──────────────────────────────────────────────────────────
+  tg <- as_tbl_graph(g)
+  lo <- create_layout(tg, layout = "stress")
+
+  # Module color palette (interpolated from Set3)
+  base_cols <- brewer.pal(min(max(n_mods, 3), 12), "Set3")
+  mod_pal   <- setNames(
+    colorRampPalette(base_cols)(n_mods),
+    sort(unique(V(g)$module))
+  )
+
+  src_pal <- source_colors[intersect(names(source_colors), unique(lo$source))]
+
+  # Nodes to label: top LABEL_TOP_N per module by significance
+  label_ids <- lo %>%
+    group_by(module) %>%
+    slice_max(neg_log_p, n = LABEL_TOP_N, with_ties = FALSE) %>%
+    pull(name)
+
+  # Nodes in modules with ≥3 members (needed for convex hull drawing)
+  lo_hull <- lo %>%
+    group_by(module) %>%
+    filter(n() >= 3) %>%
+    ungroup()
+
+  p <- ggraph(lo) +
+    # Module background: convex hulls colored per community
+    {
+      if (nrow(lo_hull) > 0)
+        geom_mark_hull(
+          data    = lo_hull,
+          aes(x = x, y = y, fill = module, group = module),
+          alpha   = 0.14,
+          color   = NA,
+          expand  = unit(6, "mm"),
+          radius  = unit(5, "mm"),
+          show.legend = FALSE
+        )
+      else
+        geom_blank()
+    } +
+    scale_fill_manual(values = mod_pal) +
+    # Edges: width encodes Jaccard index
+    geom_edge_link(
+      aes(edge_width = jaccard),
+      color = "grey50",
+      alpha = 0.55
+    ) +
+    scale_edge_width(range = c(0.3, 3.5), name = "Jaccard index") +
+    # Nodes: color = database source, size = -log10(p.adjust)
+    geom_node_point(
+      aes(color = source, size = neg_log_p),
+      alpha = 0.90
+    ) +
+    scale_color_manual(values = src_pal, name = "Database") +
+    scale_size_continuous(range = c(3, 10), name = "-log10(p.adjust)") +
+    # Labels for top nodes per module
+    geom_node_text(
+      aes(
+        label  = str_trunc(Description, 35),
+        filter = name %in% label_ids
+      ),
+      size         = 2.7,
+      color        = "grey15",
+      repel        = TRUE,
+      max.overlaps = 20
+    ) +
+    labs(
+      title    = paste0("Pathway similarity network — ", tis),
+      subtitle = paste0(
+        nrow(tis_df), " pathways | ",
+        nrow(edges),  " edges (J ≥ ", JACCARD_THRESHOLD, ") | ",
+        n_mods,        " modules (Louvain)"
+      )
+    ) +
+    theme_void(base_size = 11) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 14),
+      plot.subtitle   = element_text(hjust = 0.5, size = 9, color = "grey40"),
+      legend.position = "right",
+      legend.box      = "vertical"
+    )
+
+  print(p)
+
+  ggsave(
+    file.path(dir_output, paste0("pathway_network_", tis, ".svg")),
+    p, width = 14, height = 12
+  )
+  cat("Saved: pathway_network_", tis, ".svg\n\n", sep = "")
+}
+```
+
+# 6. Module summary across all tissues
+
+```{r module_summary}
+if (length(all_module_tables) > 0) {
+  all_modules_df <- bind_rows(all_module_tables)
+
+  write.csv(
+    all_modules_df,
+    file.path(dir_output, "pathway_modules_all_tissues.csv"),
+    row.names = FALSE
+  )
+  cat("Saved: pathway_modules_all_tissues.csv (", nrow(all_modules_df), "rows)\n\n")
+
+  cat("=== Module counts per tissue ===\n")
+  all_modules_df %>%
+    group_by(tissue) %>%
+    summarise(
+      n_modules  = n_distinct(module),
+      n_pathways = n(),
+      .groups    = "drop"
+    ) %>%
+    print()
+
+  cat("\n=== Representative pathways per module (top 3 by p.adjust) ===\n")
+  all_modules_df %>%
+    group_by(tissue, module) %>%
+    slice_min(p.adjust, n = 3, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(tissue, as.integer(module), p.adjust) %>%
+    dplyr::select(tissue, module, source, Description, p.adjust) %>%
+    print(n = Inf)
+} else {
+  cat("No module results — all tissues were skipped.\n")
+}
+```
+
+# Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

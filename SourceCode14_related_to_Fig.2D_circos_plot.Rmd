@@ -1,0 +1,317 @@
+---
+title: "Plasma miRNA — Circus plot (union pairs, cosine < -0.6, no mRNA cluster split)"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.height = 12,
+  fig.width  = 12,
+  dpi        = 300
+)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(circlize)
+library(RColorBrewer)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+wd_mrna  <- "F:/wd/Mm_Bulk_RNA-seq"
+
+tissues <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+# Tissue order for chord diagram sectors (grouped anatomically)
+custom_tissue_order <- c("bat", "ewat", "iwat", "liver", "gas", "sol", "gut", "hypo", "panc")
+
+# The mRNA GLM cluster split (A/B/C/D) is intentionally NOT used here:
+# each tissue is a single target sector.
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd_mirna, "output", "03.0.1_circus_no_mRNA_cluster", date_str)
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory:", dir_output, "\n")
+```
+
+# 3. Helper functions
+
+```{r helpers}
+# Return the path to the latest negative_cosine_pairs_union.csv.
+# Both the union-only pipeline (02.0.2) and the original one (02) write the same
+# file; the newer directory is searched first.
+find_union_pairs_csv <- function() {
+  bases <- c(
+    file.path(wd_mirna, "output", "02.0.2_integration_union"),
+    file.path(wd_mirna, "output", "02_integration")
+  )
+  for (base in bases) {
+    if (!dir.exists(base)) next
+    all_dated <- sort(list.dirs(base, full.names = TRUE, recursive = FALSE),
+                      decreasing = TRUE)
+    for (d in all_dated) {
+      f <- file.path(d, "union", "negative_cosine_pairs_union.csv")
+      if (file.exists(f)) return(f)
+    }
+  }
+  stop("negative_cosine_pairs_union.csv not found under ",
+       paste(bases, collapse = " or "))
+}
+```
+
+# 4. Load union negative pairs
+
+```{r load_pairs}
+union_csv <- find_union_pairs_csv()
+cat("Using:", union_csv, "\n")
+
+neg_union <- read.csv(union_csv, stringsAsFactors = FALSE)
+cat("Union negative pairs loaded:", nrow(neg_union), "rows\n")
+cat("Tissues present:", paste(sort(unique(neg_union$tissue)), collapse = ", "), "\n")
+print(head(neg_union))
+```
+
+# 5. Build chord summary
+
+```{r chord_data}
+# Gene count per tissue sector (unique mRNA genes)
+gene_counts <- neg_union %>%
+  distinct(tissue, SYMBOL) %>%
+  count(tissue, name = "n_genes")
+
+cat("Genes per tissue sector:\n")
+print(as.data.frame(gene_counts))
+
+# Display label lookup: tissue -> "liver (45)"
+# Tissue name is also shown on the outer arc, so the inner track carries the count
+sector_label_lookup <- gene_counts %>%
+  mutate(display_label = paste0("(", n_genes, ")")) %>%
+  dplyr::select(tissue, display_label) %>%
+  deframe()
+
+# Chord summary.
+# Ribbon weight = number of distinct target genes for that miRNA in that tissue.
+# (In the cluster-split version each miRNA-cluster link carried weight 1; with the
+#  cluster split removed, the gene count is the equivalent aggregation.)
+chord_summary <- neg_union %>%
+  distinct(miRNA_Name, tissue, SYMBOL) %>%
+  count(miRNA_Name, tissue, name = "value") %>%
+  dplyr::rename(from = miRNA_Name, to = tissue)
+
+miRNA_cluster_map <- neg_union %>%
+  distinct(from = miRNA_Name, miRNA_cluster) %>%
+  mutate(Plasma = paste0("miRNA_clust", miRNA_cluster)) %>%
+  dplyr::select(from, Plasma)
+
+chord_summary <- chord_summary %>%
+  left_join(miRNA_cluster_map, by = "from")
+
+cat("\nChord summary:\n")
+cat("  miRNA sectors :", n_distinct(chord_summary$from), "\n")
+cat("  Target sectors:", n_distinct(chord_summary$to),   "\n")
+cat("  Total links   :", nrow(chord_summary),             "\n")
+cat("  Total weight  :", sum(chord_summary$value),        "\n")
+```
+
+# 6. Color setup
+
+```{r colors}
+# miRNA cluster colors
+cluster_colors <- c(
+  "1" = "#B3E2CD",
+  "2" = "#FDCDAC",
+  "3" = "#CBD5E8",
+  "4" = "#F4CAE4",
+  "5" = "#FFF2AE"
+)
+
+# Plasma column is "miRNA_clust1" etc.; strip prefix to look up by cluster number
+miRNA_colors <- chord_summary %>%
+  distinct(from, Plasma) %>%
+  filter(!is.na(Plasma)) %>%
+  mutate(
+    clust_num = sub("miRNA_clust", "", Plasma),
+    color     = cluster_colors[clust_num]
+  ) %>%
+  dplyr::select(from, color) %>%
+  deframe()
+
+# Tissue arc colors (Pastel1 palette for the outer arc)
+tissue_colors <- setNames(
+  brewer.pal(n = max(3, length(custom_tissue_order)), name = "Pastel1")[
+    seq_along(custom_tissue_order)],
+  custom_tissue_order
+)
+
+# Target sectors are tissues, so the grid color is simply the tissue color
+all_target_sectors <- unique(chord_summary$to)
+target_grid_colors <- tissue_colors[all_target_sectors]
+
+cat("target_grid_colors:\n")
+print(target_grid_colors)
+
+grid.col <- c(miRNA_colors, target_grid_colors)
+```
+
+# 7. Sector ordering
+
+```{r ordering}
+# miRNA sectors: sorted by cluster label, then alphabetically
+sorted_miRNAs <- chord_summary %>%
+  distinct(from, Plasma) %>%
+  arrange(Plasma, from) %>%
+  pull(from)
+
+# Target sectors: one per tissue, in custom_tissue_order
+sorted_targets <- custom_tissue_order[custom_tissue_order %in% all_target_sectors]
+
+sector_order <- c(sorted_miRNAs, sorted_targets)
+
+# Validate
+missing_sectors <- setdiff(unique(c(chord_summary$from, chord_summary$to)), sector_order)
+if (length(missing_sectors) > 0) {
+  cat("Warning: missing from sector_order:", paste(missing_sectors, collapse = ", "), "\n")
+} else {
+  cat("All sectors accounted for.\n")
+}
+```
+
+# 8. Circus plot (inline)
+
+```{r chord_diagram, fig.height=12, fig.width=12}
+draw_circus <- function() {
+
+  circos.clear()
+  circos.par(
+    cell.padding = c(0.01, 0.01, 0, 0),
+    track.margin = c(0.01, 0.01),
+    canvas.xlim  = c(-1.7, 1.7),   # wider canvas to accommodate outer labels
+    canvas.ylim  = c(-1.7, 1.7)
+  )
+
+  chordDiagram(
+    chord_summary,
+    grid.col          = grid.col,
+    order             = sector_order,
+    transparency      = 0.3,
+    directional       = 1,
+    annotationTrack   = "grid",
+    preAllocateTracks = list(track.height = 0.10)   # track for miRNA names + gene counts
+  )
+
+  # Track 1: miRNA names (clockwise) + gene count for each tissue sector
+  circos.trackPlotRegion(
+    track.index = 1,
+    panel.fun   = function(x, y) {
+      si <- CELL_META$sector.index
+      if (si %in% sorted_miRNAs) {
+        circos.text(
+          CELL_META$xcenter, CELL_META$ylim[1],
+          # Drop the "mmu-" species prefix from the displayed miRNA name.
+          # Sector ids keep the full name, so ordering and colors are unaffected.
+          sub("^mmu-", "", si),
+          facing     = "clockwise",
+          niceFacing = TRUE,
+          adj        = c(0, 0.5),
+          cex        = 1.0,
+          font       = 2
+        )
+      } else if (si %in% sorted_targets) {
+        lbl <- sector_label_lookup[si]
+        if (!is.na(lbl)) {
+          circos.text(
+            CELL_META$xcenter, CELL_META$ylim[1],
+            lbl,
+            facing     = "clockwise",
+            niceFacing = TRUE,
+            adj        = c(0, 0.5),
+            cex        = 0.7,
+            font       = 1
+          )
+        }
+      }
+    },
+    bg.border = NA
+  )
+
+  # Outer layers: colored tissue arc + tissue name text.
+  # One sector per tissue, so each arc spans exactly its own sector.
+  for (tis in sorted_targets) {
+
+    col <- tissue_colors[[tis]]
+
+    start_deg <- get.cell.meta.data("cell.start.degree", sector.index = tis)
+    end_deg   <- get.cell.meta.data("cell.end.degree",   sector.index = tis)
+    mid_deg   <- (start_deg + end_deg) / 2
+    mid_rad   <- mid_deg * pi / 180
+    srt       <- mid_deg - 90
+    if (mid_deg < -90 || mid_deg > 90) srt <- srt + 180
+
+    # Layer 1: thin colored arc (just outside the sector grid at r ~ 1.0)
+    draw.sector(
+      start.degree = start_deg,
+      end.degree   = end_deg,
+      rou1         = 1.01,
+      rou2         = 1.07,
+      col          = col,
+      border       = NA
+    )
+
+    # Layer 2: tissue name text (outermost, bold)
+    text(
+      x      = 1.22 * cos(mid_rad),
+      y      = 1.22 * sin(mid_rad),
+      labels = tis,
+      cex    = 0.85,
+      font   = 2,
+      srt    = srt,
+      adj    = c(0.5, 0.5)
+    )
+  }
+
+  # Legend: miRNA clusters only (the mRNA GLM cluster legend is not applicable)
+  legend("bottomright",
+         legend = names(cluster_colors),
+         fill   = cluster_colors,
+         title  = "miRNA Clusters",
+         border = NA, cex = 1.2, text.font = 2)
+}
+
+draw_circus()
+```
+
+# 9. Save SVG
+
+```{r save_svg}
+svg_out <- file.path(dir_output, "circus_union_negative_pairs_no_mRNA_cluster.svg")
+svg(svg_out, width = 12, height = 12)
+draw_circus()
+dev.off()
+circos.clear()
+
+cat("Saved:", svg_out, "\n")
+```
+
+# Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

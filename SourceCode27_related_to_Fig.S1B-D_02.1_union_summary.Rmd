@@ -1,0 +1,457 @@
+---
+title: "Union Pairs — Summary & Cross-tissue Analysis"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.height = 6, fig.width = 8, dpi = 150)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+
+tissue_order <- c("bat", "ewat", "iwat", "liver", "gas", "sol", "gut", "hypo", "panc")
+
+# Auto-detect the latest union pairs CSV
+find_union_pairs_csv <- function() {
+  base <- file.path(wd_mirna, "output", "02_integration")
+  dated_dirs <- sort(list.dirs(base, recursive = FALSE), decreasing = TRUE)
+  for (d in dated_dirs) {
+    p <- file.path(d, "union", "negative_cosine_pairs_union.csv")
+    if (file.exists(p)) return(p)
+  }
+  stop("negative_cosine_pairs_union.csv not found under ", base)
+}
+
+union_csv <- find_union_pairs_csv()
+out_dir   <- dirname(union_csv)   # .../union/
+
+cat("Input :", union_csv, "\n")
+cat("Output:", out_dir,   "\n")
+```
+
+# 3. Load pairs
+
+```{r load}
+pairs <- read.csv(union_csv, stringsAsFactors = FALSE)
+cat("Rows:", nrow(pairs), "\n")
+print(head(pairs))
+```
+
+# 4. Summary tables
+
+## 4a. Overview
+
+```{r summary-overview}
+overview <- tibble(
+  item  = c("total_pairs", "unique_miRNAs", "unique_genes", "n_tissues"),
+  value = c(
+    nrow(pairs),
+    n_distinct(pairs$miRNA_Name),
+    n_distinct(pairs$SYMBOL),
+    n_distinct(pairs$tissue)
+  )
+)
+print(overview)
+
+write.csv(overview,
+          file.path(out_dir, "summary_overview.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: summary_overview.csv\n")
+```
+
+## 4b. Pairs per cluster
+
+```{r summary-per-cluster}
+per_cluster <- pairs %>%
+  group_by(miRNA_cluster) %>%
+  summarise(
+    n_pairs   = n(),
+    n_miRNAs  = n_distinct(miRNA_Name),
+    .groups   = "drop"
+  ) %>%
+  arrange(miRNA_cluster)
+
+print(per_cluster)
+
+write.csv(per_cluster,
+          file.path(out_dir, "summary_pairs_per_cluster.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: summary_pairs_per_cluster.csv\n")
+```
+
+## 4c. Pairs per tissue
+
+```{r summary-per-tissue}
+per_tissue <- pairs %>%
+  count(tissue, name = "n_pairs") %>%
+  complete(tissue = tissue_order, fill = list(n_pairs = 0L)) %>%
+  arrange(match(tissue, tissue_order))
+
+print(per_tissue)
+
+write.csv(per_tissue,
+          file.path(out_dir, "summary_pairs_per_tissue.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: summary_pairs_per_tissue.csv\n")
+```
+
+## 4d. Top genes
+
+```{r summary-top-genes}
+top_genes <- pairs %>%
+  group_by(SYMBOL) %>%
+  summarise(
+    n_pairs   = n(),
+    n_miRNAs  = n_distinct(miRNA_Name),
+    n_tissues = n_distinct(tissue),
+    tissues   = paste(sort(unique(tissue)), collapse = ";"),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(n_pairs))
+
+print(as_tibble(top_genes), n = 20)
+
+write.csv(top_genes,
+          file.path(out_dir, "summary_top_genes.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: summary_top_genes.csv\n")
+```
+
+## 4e. Top miRNAs
+
+```{r summary-top-mirnas}
+top_mirnas <- pairs %>%
+  group_by(miRNA_Name, miRNA_cluster) %>%
+  summarise(
+    n_pairs   = n(),
+    n_tissues = n_distinct(tissue),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(n_pairs))
+
+print(as_tibble(top_mirnas), n = 20)
+
+write.csv(top_mirnas,
+          file.path(out_dir, "summary_top_miRNAs.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: summary_top_miRNAs.csv\n")
+```
+
+## 4f. Top miRNA summary plot
+
+```{r mirna-summary-plot, fig.width=10, fig.height=5}
+MIRNA_CLUSTER_COLORS <- c(
+  "1" = "#B3E2CD",
+  "2" = "#FDCDAC",
+  "3" = "#CBD5E8",
+  "4" = "#F4CAE4",
+  "5" = "#FFF2AE"
+)
+
+# Sort: cluster order, then n_pairs descending within cluster
+plot_mirnas <- top_mirnas %>%
+  mutate(
+    miRNA_short   = sub("^mmu-", "", miRNA_Name),
+    miRNA_cluster = factor(miRNA_cluster, levels = 1:5)
+  ) %>%
+  arrange(miRNA_cluster, desc(n_pairs)) %>%
+  mutate(miRNA_short = factor(miRNA_short, levels = unique(miRNA_short)))
+
+# Dual-axis scaling: n_pairs mapped to left-axis scale
+scale_factor <- max(plot_mirnas$n_pairs) / max(plot_mirnas$n_tissues)
+
+p_mirna <- ggplot(plot_mirnas, aes(x = miRNA_short)) +
+  # n_tissues: grey wide bars (left axis)
+  geom_col(aes(y = n_tissues),
+           fill = "grey60", width = 0.65, alpha = 0.85) +
+  # n_pairs: navy narrow bars overlaid (right axis scale)
+  geom_col(aes(y = n_pairs / scale_factor),
+           fill = "navy",   width = 0.30, alpha = 0.90) +
+  # Cluster color strip along the top
+  geom_tile(aes(y = length(tissue_order) * 1.12,
+                fill = miRNA_cluster),
+            height = length(tissue_order) * 0.06,
+            width  = 0.95, show.legend = FALSE) +
+  scale_fill_manual(values = MIRNA_CLUSTER_COLORS) +
+  scale_y_continuous(
+    name     = "n tissues",
+    limits   = c(0, length(tissue_order) * 1.16),
+    breaks   = seq(0, length(tissue_order), by = 1),
+    sec.axis = sec_axis(
+      trans  = ~ . * scale_factor,
+      name   = "n pairs",
+      breaks = pretty(c(0, max(plot_mirnas$n_pairs)), n = 6)
+    )
+  ) +
+  # Cluster boundary lines
+  geom_vline(
+    xintercept = {
+      cumsum(table(plot_mirnas$miRNA_cluster))[
+        seq_len(n_distinct(plot_mirnas$miRNA_cluster) - 1)] + 0.5
+    },
+    color = "grey40", linewidth = 0.4, linetype = "dashed"
+  ) +
+  # Cluster labels centered above each group
+  annotate(
+    "text",
+    x = {
+      boundaries <- c(0, cumsum(table(plot_mirnas$miRNA_cluster)))
+      (boundaries[-1] + boundaries[-length(boundaries)]) / 2 + 0.5
+    },
+    y = length(tissue_order) * 1.15,
+    label = paste0("Cluster ", names(table(plot_mirnas$miRNA_cluster))),
+    size = 3, vjust = 0.5, fontface = "bold", color = "grey30"
+  ) +
+  labs(
+    title   = "miRNA summary: n tissues (grey) and n pairs (navy)",
+    x       = NULL,
+    caption = "Bars ordered by miRNA cluster, then n pairs descending within cluster"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x       = element_text(angle = 45, hjust = 1, size = 8),
+    axis.title.y.left  = element_text(color = "grey40", face = "bold"),
+    axis.title.y.right = element_text(color = "navy",   face = "bold"),
+    axis.ticks.y.right = element_line(color = "navy"),
+    axis.text.y.right  = element_text(color = "navy"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.caption       = element_text(color = "grey50", size = 8)
+  )
+
+print(p_mirna)
+
+ggsave(file.path(out_dir, "summary_top_miRNAs.svg"),
+       p_mirna, width = 10, height = 5)
+ggsave(file.path(out_dir, "summary_top_miRNAs.png"),
+       p_mirna, width = 10, height = 5, dpi = 300)
+cat("Saved: summary_top_miRNAs.svg / .png\n")
+```
+
+# 5. Cross-tissue shared genes
+
+## 5a. Genes detected in ≥ 2 tissues
+
+```{r shared-cross-tissue}
+# Genes present in 2+ tissues
+shared_cross <- pairs %>%
+  group_by(SYMBOL) %>%
+  summarise(
+    n_pairs   = n(),
+    n_miRNAs  = n_distinct(miRNA_Name),
+    n_tissues = n_distinct(tissue),
+    tissues   = paste(sort(unique(tissue)), collapse = ";"),
+    .groups   = "drop"
+  ) %>%
+  filter(n_tissues >= 2) %>%
+  arrange(desc(n_tissues), desc(n_pairs))
+
+cat("Genes shared across ≥2 tissues:", nrow(shared_cross), "\n")
+print(as_tibble(shared_cross), n = Inf)
+
+write.csv(shared_cross,
+          file.path(out_dir, "shared_genes_cross_tissue.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: shared_genes_cross_tissue.csv\n")
+```
+
+## 5b. Summary by number of tissues
+
+```{r shared-by-ntissues}
+summary_by_ntissues <- shared_cross %>%
+  group_by(n_tissues) %>%
+  summarise(
+    n_genes = n(),
+    genes   = paste(sort(SYMBOL), collapse = ";"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_tissues))
+
+print(summary_by_ntissues)
+
+write.csv(summary_by_ntissues,
+          file.path(out_dir, "shared_genes_summary_by_ntissues.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: shared_genes_summary_by_ntissues.csv\n")
+```
+
+## 5c. Summary by tissue pair
+
+```{r shared-by-pair}
+# All tissue pairs that share ≥ 1 gene
+tissue_pairs_df <- shared_cross %>%
+  mutate(tissue_list = strsplit(tissues, ";")) %>%
+  rowwise() %>%
+  mutate(pairs_list = list(
+    if (length(tissue_list) >= 2)
+      as.data.frame(t(combn(sort(tissue_list), 2)), stringsAsFactors = FALSE)
+    else
+      data.frame(V1 = character(0), V2 = character(0))
+  )) %>%
+  ungroup() %>%
+  dplyr::select(SYMBOL, pairs_list) %>%
+  unnest(pairs_list)
+
+summary_by_pair <- tissue_pairs_df %>%
+  group_by(tissue_pair = paste(V1, "&", V2)) %>%
+  summarise(
+    n_genes = n(),
+    genes   = paste(sort(SYMBOL), collapse = ";"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_genes))
+
+print(summary_by_pair)
+
+write.csv(summary_by_pair,
+          file.path(out_dir, "shared_genes_summary_by_pair.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: shared_genes_summary_by_pair.csv\n")
+```
+
+# 6. Tissue shared-gene matrix
+
+```{r tissue-shared-matrix, fig.width=7, fig.height=6}
+# Build shared-gene count matrix (tissue × tissue)
+tissue_gene_sets <- setNames(
+  lapply(tissue_order, function(t) {
+    top_genes$SYMBOL[sapply(strsplit(top_genes$tissues, ";"),
+                            function(tl) t %in% tl)]
+  }),
+  tissue_order
+)
+
+mat <- outer(tissue_order, tissue_order,
+             FUN = Vectorize(function(t1, t2) {
+               length(intersect(tissue_gene_sets[[t1]], tissue_gene_sets[[t2]]))
+             }))
+rownames(mat) <- colnames(mat) <- tissue_order
+
+# Export CSV
+as.data.frame(mat) %>%
+  rownames_to_column("tissue") %>%
+  write.csv(file.path(out_dir, "tissue_shared_gene_matrix.csv"),
+            row.names = FALSE, quote = FALSE)
+cat("Saved: tissue_shared_gene_matrix.csv\n")
+
+# Long format for plotting
+mat_long <- as.data.frame(mat) %>%
+  rownames_to_column("tissue_row") %>%
+  pivot_longer(-tissue_row, names_to = "tissue_col", values_to = "n_genes") %>%
+  mutate(
+    tissue_row  = factor(tissue_row, levels = tissue_order),
+    tissue_col  = factor(tissue_col, levels = tissue_order),
+    is_diag     = tissue_row == tissue_col,
+    fill_value  = if_else(is_diag, NA_real_, as.double(n_genes))
+  )
+
+p_mat <- ggplot(mat_long, aes(x = tissue_col, y = fct_rev(tissue_row))) +
+  geom_tile(aes(fill = fill_value), color = "white", linewidth = 0.6) +
+  scale_fill_gradient(
+    low      = "#deebf7",
+    high     = "#08519c",
+    na.value = "#d0d0d0",
+    name     = "Shared\ngenes",
+    limits   = c(0, max(mat_long$fill_value, na.rm = TRUE))
+  ) +
+  geom_text(aes(label = n_genes), size = 3.8, fontface = "bold", color = "black") +
+  labs(
+    title = "Shared negative-cosine target genes across tissues",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    panel.grid      = element_blank(),
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  ) +
+  coord_fixed()
+
+print(p_mat)
+
+ggsave(file.path(out_dir, "tissue_shared_gene_matrix.svg"),
+       p_mat, width = 7, height = 6)
+ggsave(file.path(out_dir, "tissue_shared_gene_matrix.png"),
+       p_mat, width = 7, height = 6, dpi = 300)
+cat("Saved: tissue_shared_gene_matrix.svg / .png\n")
+```
+
+# 7. Binary presence matrix (shared genes × tissue)
+
+```{r binary-matrix, fig.width=6, fig.height=8}
+# Gene order: alphabetical
+gene_order <- sort(shared_cross$SYMBOL)
+
+mat_long_bin <- shared_cross %>%
+  mutate(tissue_list = strsplit(tissues, ";")) %>%
+  unnest(tissue_list) %>%
+  mutate(present = 1L) %>%
+  dplyr::select(SYMBOL, tissue = tissue_list, present) %>%
+  complete(SYMBOL, tissue = tissue_order, fill = list(present = 0L)) %>%
+  mutate(
+    tissue = factor(tissue, levels = tissue_order),
+    SYMBOL = factor(SYMBOL, levels = gene_order)
+  )
+
+# Export wide CSV
+mat_wide_bin <- mat_long_bin %>%
+  pivot_wider(names_from = tissue, values_from = present, values_fill = 0L) %>%
+  arrange(match(SYMBOL, gene_order))
+
+write.csv(mat_wide_bin,
+          file.path(out_dir, "shared_gene_binary_matrix.csv"),
+          row.names = FALSE, quote = FALSE)
+cat("Saved: shared_gene_binary_matrix.csv\n")
+
+# Plot
+p_bin <- ggplot(mat_long_bin, aes(x = tissue, y = fct_rev(SYMBOL))) +
+  geom_tile(aes(fill = factor(present)), color = "white", linewidth = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "#f0f0f0", "1" = "#08519c"),
+    labels = c("0" = "Absent",  "1" = "Present"),
+    name   = NULL
+  ) +
+  geom_text(
+    data = filter(mat_long_bin, present == 1),
+    aes(label = "\u25cf"), color = "white", size = 3
+  ) +
+  labs(
+    title = "Cross-tissue shared genes \u2014 binary presence matrix",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y     = element_text(face = "italic"),
+    panel.grid      = element_blank(),
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  ) +
+  coord_fixed()
+
+print(p_bin)
+
+ggsave(file.path(out_dir, "shared_gene_binary_matrix.svg"),
+       p_bin, width = 6, height = 8)
+ggsave(file.path(out_dir, "shared_gene_binary_matrix.png"),
+       p_bin, width = 6, height = 8, dpi = 300)
+cat("Saved: shared_gene_binary_matrix.svg / .png\n")
+```

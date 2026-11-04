@@ -1,0 +1,1048 @@
+---
+title: "04.4.3 Module pathway activity — logistic-filtered, target-score ordered"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.height = 10,
+  fig.width  = 12,
+  dpi        = 150
+)
+```
+
+# 1. Libraries
+
+Required packages:
+
+``` r
+install.packages(c("RColorBrewer", "patchwork"))
+BiocManager::install(c("ComplexHeatmap", "circlize",
+                       "org.Mm.eg.db", "clusterProfiler",
+                       "msigdbr", "reactome.db", "GSVA", "biomaRt"))
+```
+
+```{r libraries}
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(org.Mm.eg.db)
+library(clusterProfiler)
+library(msigdbr)
+library(GSVA)
+library(biomaRt)
+library(splines)
+library(patchwork)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+wd_mrna  <- "F:/wd/Mm_Bulk_RNA-seq"
+
+tissues <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+MIN_TARGET_GENES <- 2
+
+TIMEPOINT_LEVELS <- c("0d", "1d", "3d", "1wk", "2wk", "4wk",
+                      "6wk", "8wk", "10wk", "12wk")
+
+TIMEPOINT_DAYS <- setNames(
+  c(0, 1, 3, 7, 14, 28, 42, 56, 70, 84),
+  TIMEPOINT_LEVELS
+)
+
+MIRNA_PAIRS_CSV <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs/output/02_integration/2026-04-27/union/negative_cosine_pairs_union.csv"
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd_mirna, "output", "04.4.3_module_activity", date_str)
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("Output:", dir_output, "\n")
+
+tissue_pal <- setNames(
+  colorRampPalette(brewer.pal(9, "Set1"))(length(tissues)),
+  tissues
+)
+```
+
+# 3. Load module membership and pathway gene lists
+
+```{r helpers_load}
+find_latest_dated_dir <- function(base) {
+  dirs  <- list.dirs(base, full.names = TRUE, recursive = FALSE)
+  dated <- sort(dirs[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(dirs))],
+                decreasing = TRUE)
+  if (length(dated) == 0) stop("No dated subdirectory under: ", base)
+  cat("Using:", dated[1], "\n")
+  dated[1]
+}
+
+parse_gene_set <- function(gene_str) {
+  if (is.na(gene_str) || gene_str == "") return(character(0))
+  unique(trimws(unlist(strsplit(as.character(gene_str), "/"))))
+}
+```
+
+```{r load_modules}
+dir_04_3    <- find_latest_dated_dir(file.path(wd_mirna, "output", "04.3_pathway_network"))
+modules_csv <- file.path(dir_04_3, "pathway_modules_all_tissues.csv")
+
+if (!file.exists(modules_csv))
+  stop("pathway_modules_all_tissues.csv not found — run 04.3 first.\n", modules_csv)
+
+all_modules_df <- read.csv(modules_csv, stringsAsFactors = FALSE) %>%
+  mutate(
+    module     = as.character(module),
+    source_db  = sub("\\|.*$",    "", node_id),
+    pathway_id = sub("^[^|]+\\|", "", node_id)
+  )
+
+cat("Module entries loaded:", nrow(all_modules_df), "\n")
+cat("Tissues:", paste(sort(unique(all_modules_df$tissue)), collapse = ", "), "\n")
+```
+
+# 4. Module gene sets from enrichment hit genes (geneID)
+
+For each module, use the union of the geneID entries (i.e., the genes actually identified as hits) from the 04_GO_KEGG enrichment results as the module gene set.
+
+```{r load_enrichment_csv}
+base_04   <- file.path(wd_mirna, "output", "04_GO_KEGG")
+input_dir <- find_latest_dated_dir(base_04)
+
+safe_read_enrich <- function(path) {
+  if (!file.exists(path)) { cat("Not found — skipped:", basename(path), "\n"); return(NULL) }
+  df <- read.csv(path, stringsAsFactors = FALSE)
+  cat("Loaded", nrow(df), "rows from:", basename(path), "\n")
+  df
+}
+
+go_bp_all    <- safe_read_enrich(file.path(input_dir, "GO",       "GO_BP_tissue_cluster_all.csv"))
+kegg_all     <- safe_read_enrich(file.path(input_dir, "KEGG",     "KEGG_tissue_cluster_all.csv"))
+msigdb_all   <- safe_read_enrich(file.path(input_dir, "MSigDB",   "MSigDB_tissue_cluster_all.csv"))
+reactome_all <- safe_read_enrich(file.path(input_dir, "Reactome", "Reactome_tissue_cluster_all.csv"))
+
+add_source_enrich <- function(df, src) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  df %>%
+    filter(!is.na(geneID), geneID != "") %>%
+    mutate(source  = src,
+           node_id = paste0(src, "|", ID)) %>%
+    dplyr::select(tissue, node_id, geneID)
+}
+
+msigdb_rows <- if (!is.null(msigdb_all) && nrow(msigdb_all) > 0) {
+  bind_rows(lapply(unique(msigdb_all$msigdb_set), function(s) {
+    add_source_enrich(msigdb_all %>% filter(msigdb_set == s), paste0("MSigDB:", s))
+  }))
+} else NULL
+
+all_enrich_hits <- bind_rows(
+  add_source_enrich(go_bp_all,    "GO BP"),
+  add_source_enrich(kegg_all,     "KEGG"),
+  add_source_enrich(reactome_all, "Reactome"),
+  msigdb_rows
+)
+
+cat("Total enrichment entries with geneID:", nrow(all_enrich_hits), "\n")
+```
+
+```{r db_pathway_genes}
+mod_ids <- all_modules_df %>% distinct(source_db, pathway_id)
+
+msigdb_source_map <- tibble(
+  source_db   = c("MSigDB:Hallmark", "MSigDB:C2_KEGG",
+                  "MSigDB:C2_Reactome", "MSigDB:C2_WikiPathways"),
+  category    = c("H",  "C2",  "C2",  "C2"),
+  subcategory = c(NA,   "CP:KEGG", "CP:REACTOME", "CP:WIKIPATHWAYS")
+)
+
+msigdb_full <- bind_rows(lapply(
+  intersect(msigdb_source_map$source_db, unique(mod_ids$source_db)),
+  function(src) {
+    row <- msigdb_source_map[msigdb_source_map$source_db == src, ]
+    df  <- if (is.na(row$subcategory))
+      msigdbr(species = "Mus musculus", category = row$category)
+    else
+      msigdbr(species = "Mus musculus", category = row$category,
+              subcategory = row$subcategory)
+    df %>%
+      filter(gs_name %in% mod_ids$pathway_id[mod_ids$source_db == src]) %>%
+      mutate(source = src) %>%
+      dplyr::select(source, ID = gs_name, symbol = gene_symbol)
+  }
+))
+
+go_ids_need <- mod_ids$pathway_id[mod_ids$source_db == "GO BP"]
+go_full <- if (length(go_ids_need) > 0) {
+  tryCatch({
+    AnnotationDbi::select(org.Mm.eg.db, keys = go_ids_need,
+                          columns = c("SYMBOL", "ONTOLOGY"), keytype = "GO") %>%
+      filter(ONTOLOGY == "BP", !is.na(SYMBOL)) %>%
+      mutate(source = "GO BP") %>%
+      dplyr::select(source, ID = GO, symbol = SYMBOL) %>%
+      distinct()
+  }, error = function(e) { cat("GO BP lookup failed:", e$message, "\n"); NULL })
+} else NULL
+
+kegg_ids_need <- mod_ids$pathway_id[mod_ids$source_db == "KEGG"]
+kegg_full <- if (length(kegg_ids_need) > 0) {
+  tryCatch({
+    kegg_data <- clusterProfiler::download_KEGG("mmu")
+    p2g <- kegg_data$KEGGPATHID2EXTID %>%
+      rename(ID = from, entrezid = to) %>%
+      filter(ID %in% kegg_ids_need)
+    sym_map <- bitr(unique(p2g$entrezid), fromType = "ENTREZID",
+                    toType = "SYMBOL", OrgDb = org.Mm.eg.db)
+    p2g %>%
+      left_join(sym_map, by = c("entrezid" = "ENTREZID")) %>%
+      filter(!is.na(SYMBOL)) %>%
+      mutate(source = "KEGG") %>%
+      dplyr::select(source, ID, symbol = SYMBOL) %>%
+      distinct()
+  }, error = function(e) { cat("KEGG lookup failed:", e$message, "\n"); NULL })
+} else NULL
+
+reactome_ids_need <- mod_ids$pathway_id[mod_ids$source_db == "Reactome"]
+reactome_full <- if (length(reactome_ids_need) > 0 &&
+                     requireNamespace("reactome.db", quietly = TRUE)) {
+  tryCatch({
+    library(reactome.db)
+    r2e <- as.data.frame(reactomePATHID2EXTID) %>%
+      filter(DB_ID %in% reactome_ids_need)
+    sym_map_r <- bitr(unique(r2e$gene_id), fromType = "ENTREZID",
+                      toType = "SYMBOL", OrgDb = org.Mm.eg.db)
+    r2e %>%
+      left_join(sym_map_r, by = c("gene_id" = "ENTREZID")) %>%
+      filter(!is.na(SYMBOL)) %>%
+      mutate(source = "Reactome") %>%
+      dplyr::select(source, ID = DB_ID, symbol = SYMBOL) %>%
+      distinct()
+  }, error = function(e) { cat("Reactome lookup failed:", e$message, "\n"); NULL })
+} else { cat("reactome.db not available — skipped.\n"); NULL }
+
+pathway_db_genes <- bind_rows(msigdb_full, go_full, kegg_full, reactome_full)
+cat("DB genes fetched for",
+    n_distinct(paste(pathway_db_genes$source, pathway_db_genes$ID)), "pathways\n")
+```
+
+```{r module_gene_sets}
+pathway_hit_genes <- all_enrich_hits %>%
+  group_by(tissue, node_id) %>%
+  summarise(
+    target_genes = list(unique(unlist(lapply(geneID, parse_gene_set)))),
+    .groups = "drop"
+  )
+
+pathway_db_gene_list <- pathway_db_genes %>%
+  mutate(node_id = paste0(source, "|", ID)) %>%
+  group_by(node_id) %>%
+  summarise(db_genes = list(unique(symbol)), .groups = "drop")
+
+module_gene_meta <- all_modules_df %>%
+  left_join(pathway_hit_genes,    by = c("tissue", "node_id")) %>%
+  left_join(pathway_db_gene_list, by = "node_id") %>%
+  group_by(tissue, module) %>%
+  summarise(
+    gene_union        = list(unique(unlist(db_genes[!sapply(db_genes,      is.null)]))),
+    target_gene_union = list(unique(unlist(target_genes[!sapply(target_genes, is.null)]))),
+    n_pathways        = n_distinct(pathway_id),
+    .groups           = "drop"
+  ) %>%
+  mutate(
+    n_genes        = lengths(gene_union),
+    n_target_genes = lengths(target_gene_union),
+    module_id      = paste0(tissue, "_mod", module)
+  ) %>%
+  filter(n_genes > 0)
+
+module_gene_meta <- module_gene_meta %>%
+  mutate(
+    exclusive_gene_union = map2(gene_union, target_gene_union,
+                                function(gu, tgu) setdiff(gu, tgu)),
+    n_exclusive_genes    = lengths(exclusive_gene_union)
+  )
+
+cat("Tissue-modules with gene sets:", nrow(module_gene_meta), "\n\n")
+module_gene_meta %>%
+  dplyr::select(tissue, module, module_id, n_pathways,
+                n_genes, n_target_genes, n_exclusive_genes) %>%
+  arrange(tissue, as.integer(module)) %>%
+  print(n = Inf)
+```
+
+# 4b. Diagnostics: module filtering funnel (steps 0–1)
+
+```{r filter_diagnostics}
+step0 <- all_modules_df %>% distinct(tissue, module) %>% mutate(step = "0_all_modules")
+step1 <- module_gene_meta %>% distinct(tissue, module) %>% mutate(step = "1_gene_set_ok")
+
+dropped_modules <- all_modules_df %>%
+  distinct(tissue, module) %>%
+  anti_join(module_gene_meta %>% distinct(tissue, module), by = c("tissue", "module")) %>%
+  mutate(reason = "no geneID hit genes found in enrichment results")
+
+cat("=== Filtering funnel (steps 0–1) ===\n")
+cat("Step 0 — tissue-modules in pathway_modules_all_tissues.csv:", nrow(step0), "\n")
+cat("Step 1 — after geneID hit-gene check                      :", nrow(step1), "\n")
+cat("  Dropped:", nrow(step0) - nrow(step1), "\n")
+if (nrow(dropped_modules) > 0) print(dropped_modules %>% arrange(tissue, as.integer(module)), n = Inf)
+```
+
+# 5. Load mRNA expression data and miRNA-target pairs
+
+```{r load_expr}
+find_expr_csv <- function(tissue) {
+  fname    <- paste0(tissue, "_nonzero_Log2TPM.csv")
+  base     <- file.path(wd_mrna, "output", tissue)
+  f        <- file.path(base, fname)
+  if (file.exists(f)) return(f)
+  all_dirs <- list.dirs(base, full.names = TRUE, recursive = FALSE)
+  dated    <- sort(all_dirs[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(all_dirs))],
+                   decreasing = TRUE)
+  for (d in dated) { f <- file.path(d, fname); if (file.exists(f)) return(f) }
+  NULL
+}
+
+tissue_expr_raw <- setNames(lapply(tissues, function(tis) {
+  f <- find_expr_csv(tis)
+  if (is.null(f)) { cat("Expression file not found:", tis, "\n"); return(NULL) }
+  df <- read.csv(f, stringsAsFactors = FALSE)
+  if (!all(c("symbol", "sample.ID", "Log2TPM", "timepoint") %in% names(df))) {
+    cat("Missing expected columns in:", tis, "\n"); return(NULL)
+  }
+  df %>%
+    dplyr::select(symbol, sample.ID, Log2TPM, timepoint) %>%
+    filter(!is.na(Log2TPM), !is.na(symbol), symbol != "") %>%
+    mutate(replicate = as.integer(sub(".*_(\\d+)$", "\\1", sample.ID)))
+}), tissues)
+tissue_expr_raw <- Filter(Negate(is.null), tissue_expr_raw)
+
+tissue_expr_raw <- lapply(tissue_expr_raw, function(df) {
+  df %>% mutate(timepoint = factor(timepoint, levels = TIMEPOINT_LEVELS, ordered = TRUE))
+})
+
+cat("Expression data loaded for:", paste(names(tissue_expr_raw), collapse = ", "), "\n")
+```
+
+```{r load_mirna_pairs}
+if (!file.exists(MIRNA_PAIRS_CSV))
+  stop("miRNA pairs file not found: ", MIRNA_PAIRS_CSV)
+
+mirna_pairs <- read.csv(MIRNA_PAIRS_CSV, stringsAsFactors = FALSE)
+cat("miRNA pairs:", nrow(mirna_pairs), "rows |",
+    "Tissues:", paste(sort(unique(mirna_pairs$tissue)), collapse = ", "), "\n")
+
+tis_no_mirna <- setdiff(sort(unique(all_modules_df$tissue)),
+                        sort(unique(mirna_pairs$tissue)))
+if (length(tis_no_mirna) > 0)
+  cat("  Tissues with modules but NO miRNA pairs:", paste(tis_no_mirna, collapse = ", "), "\n")
+```
+
+# 5b. Gene lengths (covariate for logistic regression)
+
+```{r gene_lengths}
+gene_len_tbl <- tryCatch({
+  mart <- biomaRt::useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+  df   <- biomaRt::getBM(attributes = c("external_gene_name", "transcript_length"), mart = mart)
+  df %>%
+    rename(symbol = external_gene_name) %>%
+    filter(!is.na(transcript_length), symbol != "") %>%
+    group_by(symbol) %>%
+    summarise(gene_length = max(transcript_length), .groups = "drop")
+}, error = function(e) {
+  cat("biomaRt unavailable:", conditionMessage(e), "\n")
+  cat("gene_length covariate will be omitted from logistic regression.\n")
+  NULL
+})
+if (!is.null(gene_len_tbl)) cat("Gene lengths retrieved for", nrow(gene_len_tbl), "symbols\n")
+```
+
+# Helper functions
+
+```{r gsva_helpers}
+make_expr_mat <- function(expr_long) {
+  expr_long %>%
+    dplyr::select(symbol, sample.ID, Log2TPM) %>%
+    group_by(symbol, sample.ID) %>%
+    summarise(Log2TPM = mean(Log2TPM, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = sample.ID, values_from = Log2TPM, values_fill = NA_real_) %>%
+    column_to_rownames("symbol") %>%
+    as.matrix()
+}
+
+run_gsva_safe <- function(expr_mat, gene_sets, min_sz = 1) {
+  valid <- Filter(function(gs) length(gs) >= min_sz, gene_sets)
+  if (length(valid) == 0) return(NULL)
+  tryCatch({
+    param <- gsvaParam(exprData = expr_mat, geneSets = valid,
+                       kcdf = "Gaussian", minSize = min_sz, maxSize = Inf)
+    gsva(param, verbose = FALSE)
+  }, error = function(e1) {
+    tryCatch(
+      gsva(expr_mat, valid, method = "gsva", kcdf = "Gaussian",
+           min.sz = min_sz, verbose = FALSE),
+      error = function(e2) { cat("  GSVA failed:", conditionMessage(e2), "\n"); NULL }
+    )
+  })
+}
+
+gsva_to_long <- function(gsva_mat, tis, expr_raw) {
+  samp_meta <- expr_raw %>% distinct(sample.ID, timepoint, replicate)
+  as.data.frame(gsva_mat) %>%
+    rownames_to_column("module_id") %>%
+    pivot_longer(-module_id, names_to = "sample.ID", values_to = "score") %>%
+    left_join(samp_meta, by = "sample.ID") %>%
+    mutate(tissue = tis, module = sub(".*_mod", "", module_id))
+}
+
+safe_hclust <- function(mat, method = "ward.D2", dist_method = "euclidean",
+                        reorder_by = NULL) {
+  if (nrow(mat) <= 1) return(FALSE)
+  m <- mat; m[!is.finite(m)] <- 0
+  d <- if (dist_method == "correlation") as.dist(1 - cor(t(m))) else dist(m, method = dist_method)
+  hc <- tryCatch(hclust(d, method = method), error = function(e) FALSE)
+  if (isFALSE(hc) || is.null(reorder_by)) return(hc)
+  tryCatch(
+    as.hclust(reorder(as.dendrogram(hc), reorder_by, agglo.FUN = mean)),
+    error = function(e) hc
+  )
+}
+
+row_peak_weights <- function(mat) {
+  apply(mat, 1, function(row) {
+    row[!is.finite(row)] <- 0
+    w <- pmax(row, 0)
+    if (sum(w) < 1e-10) return(ncol(mat) / 2)
+    sum(seq_along(row) * w) / sum(w)
+  })
+}
+
+# Shared GSVA color scale (symmetric diverging, -1 to 1)
+col_fun <- colorRamp2(c(-1, 0, 1), c("#4575B4", "white", "#D73027"))
+```
+
+# 6. Logistic regression: miRNA-target enrichment per module
+
+Unit of observation: each gene detected in the tissue.
+Outcome `is_target`: 1 if gene is a miRNA negative-cosine target in this tissue.
+Predictor `in_module`: 1 if gene belongs to this module's `gene_union` ∩ detected.
+Covariates: `expression_level` (mean Log2TPM), `gene_length` (log1p; omitted if biomaRt unavailable).
+
+OR > 1 for `in_module` indicates module genes are more likely to be miRNA targets
+than equally expressed, equally long non-module genes.
+
+```{r logistic_enrichment}
+logistic_results <- bind_rows(lapply(names(tissue_expr_raw), function(tis) {
+  detected     <- rownames(make_expr_mat(tissue_expr_raw[[tis]]))
+  mod_tis      <- module_gene_meta %>% filter(tissue == tis)
+  if (nrow(mod_tis) == 0) return(NULL)
+
+  target_genes <- unique(mirna_pairs$SYMBOL[mirna_pairs$tissue == tis])
+
+  expr_mean <- tissue_expr_raw[[tis]] %>%
+    group_by(symbol) %>%
+    summarise(expression_level = mean(Log2TPM, na.rm = TRUE), .groups = "drop")
+
+  med_len <- if (!is.null(gene_len_tbl)) median(gene_len_tbl$gene_length, na.rm = TRUE) else NA_real_
+
+  bind_rows(lapply(seq_len(nrow(mod_tis)), function(i) {
+    module_genes <- intersect(mod_tis$gene_union[[i]], detected)
+
+    df_lr <- tibble(gene      = detected,
+                    in_module = as.integer(gene %in% module_genes),
+                    is_target = as.integer(gene %in% target_genes)) %>%
+      left_join(expr_mean, by = c("gene" = "symbol")) %>%
+      mutate(expression_level = coalesce(expression_level, 0))
+
+    if (!is.null(gene_len_tbl)) {
+      df_lr <- df_lr %>%
+        left_join(gene_len_tbl, by = c("gene" = "symbol")) %>%
+        mutate(gene_length = log1p(coalesce(gene_length, med_len)))
+    }
+
+    if (sum(df_lr$in_module) == 0 || sum(df_lr$is_target) == 0) return(NULL)
+
+    formula_lr <- if (!is.null(gene_len_tbl))
+      is_target ~ in_module + expression_level + gene_length
+    else
+      is_target ~ in_module + expression_level
+
+    tryCatch({
+      fit <- glm(formula_lr, data = df_lr, family = binomial)
+      ct  <- summary(fit)$coefficients
+      if (!"in_module" %in% rownames(ct)) return(NULL)
+      ci  <- tryCatch(exp(confint.default(fit)["in_module", ]),
+                      error = function(e) c(NA_real_, NA_real_))
+      tibble(
+        tissue     = tis,
+        module     = mod_tis$module[i],
+        module_id  = mod_tis$module_id[i],
+        n_detected = length(detected),
+        n_module   = sum(df_lr$in_module),
+        n_target   = sum(df_lr$is_target),
+        n_overlap  = sum(df_lr$in_module == 1L & df_lr$is_target == 1L),
+        OR         = exp(ct["in_module", "Estimate"]),
+        CI_lo      = ci[1],
+        CI_hi      = ci[2],
+        p_value    = ct["in_module", "Pr(>|z|)"],
+        log2OR     = log2(exp(ct["in_module", "Estimate"])),
+        model      = if (!is.null(gene_len_tbl)) "in_module+expr+len" else "in_module+expr"
+      )
+    }, error = function(e) NULL)
+  }))
+}))
+
+logistic_results <- logistic_results %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+cat("Logistic regression complete:", nrow(logistic_results), "tissue-modules\n")
+cat("OR > 1, p_adj < 0.05:", sum(logistic_results$OR > 1 & logistic_results$p_adj < 0.05, na.rm = TRUE), "\n")
+cat("OR < 1, p_adj < 0.05:", sum(logistic_results$OR < 1 & logistic_results$p_adj < 0.05, na.rm = TRUE), "\n\n")
+
+logistic_results %>%
+  arrange(p_value) %>%
+  dplyr::select(tissue, module, module_id, n_module, n_target, n_overlap,
+                OR, CI_lo, CI_hi, p_value, p_adj) %>%
+  print(n = 30)
+
+write.csv(logistic_results,
+          file.path(dir_output, "logistic_enrichment.csv"),
+          row.names = FALSE)
+cat("Saved: logistic_enrichment.csv\n")
+```
+
+```{r logistic_forest, fig.height=8, fig.width=10}
+if (nrow(logistic_results) > 0) {
+  mid_levels_lr <- logistic_results %>%
+    arrange(tissue, desc(as.integer(module))) %>%
+    pull(module_id) %>% unique()
+
+  plot_df_lr <- logistic_results %>%
+    mutate(
+      module_id = factor(module_id, levels = mid_levels_lr),
+      log2CI_lo = log2(pmax(CI_lo, 1e-6)),
+      log2CI_hi = log2(pmax(CI_hi, 1e-6)),
+      sig_label = case_when(p_adj < 0.001 ~ "***", p_adj < 0.01 ~ "**",
+                            p_adj < 0.05  ~ "*",   TRUE          ~ "")
+    )
+
+  p_lor <- ggplot(plot_df_lr, aes(x = log2OR, y = module_id)) +
+    geom_vline(xintercept = 0, color = "grey50", linetype = "dashed", linewidth = 0.7) +
+    geom_errorbarh(aes(xmin = log2CI_lo, xmax = log2CI_hi),
+                   height = 0.3, color = "grey40", na.rm = TRUE) +
+    geom_point(aes(fill = p_adj < 0.05, size = -log10(p_adj + 1e-10)),
+               shape = 21, color = "grey20") +
+    geom_text(aes(x = log2CI_hi, label = sig_label),
+              hjust = -0.3, vjust = 0.5, size = 3.5, color = "#D73027", na.rm = TRUE) +
+    scale_fill_manual(values = c("FALSE" = "grey80", "TRUE" = "#D73027"),
+                      name = "p_adj < 0.05") +
+    scale_size_continuous(range = c(2, 6), name = "-log10\n(p_adj)") +
+    facet_wrap(~ tissue, scales = "free_y", ncol = 3) +
+    labs(x = "log2(OR)  —  miRNA-target enrichment in module", y = NULL,
+         title    = "Logistic regression: miRNA-target enrichment per tissue-module",
+         subtitle = "Error bars = 95% CI (Wald);  filled = p_adj < 0.05") +
+    theme_bw(base_size = 10) +
+    theme(strip.text = element_text(face = "bold"), panel.grid.minor = element_blank(),
+          legend.position = "bottom")
+
+  n_mods_lr <- max(table(plot_df_lr$tissue))
+  fig_h_lr  <- max(4, n_mods_lr * 0.45 + 2) * ceiling(n_distinct(plot_df_lr$tissue) / 3)
+  print(p_lor)
+
+  ggsave(file.path(dir_output, "logistic_enrichment_forest.png"),
+         p_lor, width = 10, height = fig_h_lr, dpi = 150)
+  ggsave(file.path(dir_output, "logistic_enrichment_forest.svg"),
+         p_lor, width = 10, height = fig_h_lr)
+  cat("Saved: logistic_enrichment_forest.png / .svg\n")
+}
+```
+
+# 6b. Filter modules: OR > 1, p_adj < 0.05
+
+Modules passing this filter are used in all subsequent analyses.
+
+```{r filter_modules}
+sig_mods <- logistic_results %>%
+  filter(OR > 1, p_adj < 0.05) %>%
+  distinct(tissue, module, module_id)
+
+cat("Modules passing logistic filter (OR > 1, p_adj < 0.05):", nrow(sig_mods), "\n\n")
+print(sig_mods %>% arrange(tissue, as.integer(module)), n = Inf)
+
+module_gene_meta_filt <- module_gene_meta %>%
+  semi_join(sig_mods, by = c("tissue", "module", "module_id"))
+
+cat("\nFiltered module_gene_meta:", nrow(module_gene_meta_filt), "modules\n")
+
+# Update step-1 to step-2 in funnel
+step2_log <- module_gene_meta_filt %>%
+  distinct(tissue, module) %>%
+  mutate(step = "2_logistic_ok")
+
+cat("\n=== Filtering funnel (steps 0–2) ===\n")
+bind_rows(step0, step1, step2_log) %>%
+  count(step) %>% arrange(step) %>% print()
+
+write.csv(sig_mods, file.path(dir_output, "logistic_filtered_modules.csv"),
+          row.names = FALSE)
+cat("Saved: logistic_filtered_modules.csv\n")
+```
+
+# 7. GSVA: Target score (logistic-filtered modules)
+
+**Gene set**: `target_gene_union` ∩ detected genes (min `r MIN_TARGET_GENES` genes).
+
+```{r run_gsva_target, message=TRUE}
+gsva_target_mats   <- list()
+target_meta_list   <- list()
+target_geneset_list <- list()
+
+for (tis in names(tissue_expr_raw)) {
+  cat("\n──", tis, "──\n")
+  expr_mat <- make_expr_mat(tissue_expr_raw[[tis]])
+  detected <- rownames(expr_mat)
+  mod_tis  <- module_gene_meta_filt %>% filter(tissue == tis)
+
+  if (nrow(mod_tis) == 0) { cat("  No filtered modules — skipped\n"); next }
+
+  target_sets <- setNames(
+    lapply(seq_len(nrow(mod_tis)), function(i)
+      intersect(mod_tis$target_gene_union[[i]], detected)),
+    mod_tis$module_id
+  )
+  cat("  Target sets:", sum(sapply(target_sets, length) >= MIN_TARGET_GENES),
+      "valid (>=", MIN_TARGET_GENES, "genes),",
+      sum(sapply(target_sets, length) < MIN_TARGET_GENES), "below min\n")
+
+  target_meta_list[[tis]] <- mod_tis %>%
+    rowwise() %>%
+    mutate(n_target = length(intersect(target_gene_union, detected))) %>%
+    ungroup() %>%
+    dplyr::select(module_id, n_target)
+
+  res_tgt <- run_gsva_safe(expr_mat, target_sets, min_sz = MIN_TARGET_GENES)
+  if (!is.null(res_tgt)) gsva_target_mats[[tis]] <- res_tgt
+  target_geneset_list[[tis]] <- target_sets
+}
+
+cat("\nGSVA target score complete:", length(gsva_target_mats), "tissues\n")
+
+target_list <- bind_rows(lapply(names(gsva_target_mats), function(tis) {
+  gsva_to_long(gsva_target_mats[[tis]], tis, tissue_expr_raw[[tis]]) %>%
+    rename(target_score = score) %>%
+    left_join(target_meta_list[[tis]], by = "module_id")
+}))
+```
+
+```{r save_target_genesets}
+target_geneset_df <- bind_rows(lapply(names(target_geneset_list), function(tis) {
+  gs <- target_geneset_list[[tis]]
+  bind_rows(lapply(names(gs), function(mid) {
+    genes <- gs[[mid]]
+    if (length(genes) == 0) return(NULL)
+    tibble(tissue = tis, module_id = mid, gene = genes)
+  }))
+})) %>%
+  mutate(module = sub("^[^_]+_mod", "", module_id)) %>%
+  arrange(tissue, module_id, gene) %>%
+  dplyr::select(tissue, module_id, module, gene)
+
+cat("Target geneset rows:", nrow(target_geneset_df),
+    "| modules:", n_distinct(target_geneset_df$module_id), "\n")
+write.csv(target_geneset_df,
+          file.path(dir_output, "target_score_genesets.csv"), row.names = FALSE)
+cat("Saved: target_score_genesets.csv\n")
+```
+
+# 7b. Target score heatmap — defines combined figure row order
+
+Hierarchical clustering with correlation distance (1 − Pearson r) and ward.D2 linkage.
+The resulting row order is applied to all three panels in the combined figure (Section 10).
+
+```{r target_heatmap, fig.height=12, fig.width=10}
+target_tp <- target_list %>%
+  group_by(tissue, module, module_id, timepoint) %>%
+  summarise(mean_score = mean(target_score, na.rm = TRUE), .groups = "drop")
+
+target_mat <- target_tp %>%
+  dplyr::select(module_id, timepoint, mean_score) %>%
+  pivot_wider(names_from = timepoint, values_from = mean_score) %>%
+  column_to_rownames("module_id") %>%
+  as.matrix()
+
+tp_target_cols <- TIMEPOINT_LEVELS[TIMEPOINT_LEVELS %in% colnames(target_mat)]
+target_mat     <- target_mat[, tp_target_cols, drop = FALSE]
+
+# Hierarchical clustering: this object is reused in the combined figure
+hc_target <- safe_hclust(target_mat,
+                         dist_method = "correlation",
+                         reorder_by  = row_peak_weights(target_mat))
+
+row_order_combined <- if (!isFALSE(hc_target)) {
+  rownames(target_mat)[hc_target$order]
+} else {
+  rownames(target_mat)
+}
+
+cat("Row order for combined figure (", length(row_order_combined), "modules ):\n")
+cat(paste(row_order_combined, collapse = ", "), "\n")
+
+row_tis_s <- sub("_mod.*$", "", rownames(target_mat))
+ha_row_s  <- rowAnnotation(
+  Tissue = anno_simple(row_tis_s, col = tissue_pal[row_tis_s]),
+  annotation_name_side = "top", annotation_name_gp = gpar(fontsize = 9)
+)
+
+n_tgt_df  <- target_list %>%
+  group_by(module_id) %>% summarise(n_target = max(n_target), .groups = "drop")
+n_tgt_vec <- setNames(n_tgt_df$n_target, n_tgt_df$module_id)
+ha_row_r  <- rowAnnotation(
+  n_miRNA_targets = anno_barplot(n_tgt_vec[rownames(target_mat)],
+                                 gp = gpar(fill = "#E07B39"), width = unit(2, "cm")),
+  annotation_name_side = "top", annotation_name_gp = gpar(fontsize = 8)
+)
+
+ht_target <- Heatmap(
+  target_mat,
+  name              = "GSVA\n(target\nscore)",
+  col               = col_fun,
+  na_col            = "grey88",
+  cluster_rows      = hc_target,
+  cluster_columns   = FALSE,
+  column_order      = tp_target_cols,
+  left_annotation   = ha_row_s,
+  right_annotation  = ha_row_r,
+  row_names_gp      = gpar(fontsize = 7),
+  column_names_gp   = gpar(fontsize = 9, fontface = "bold"),
+  column_title      = "Timepoint",
+  column_title_side = "bottom",
+  row_title         = paste0("Tissue-module (n = ", nrow(target_mat), ")"),
+  heatmap_legend_param = list(title_position = "leftcenter-rot")
+)
+
+draw(ht_target, merge_legend = TRUE)
+
+png(file.path(dir_output, "target_score_heatmap.png"),
+    width = 2600, height = max(1200, nrow(target_mat) * 30 + 400), res = 200)
+draw(ht_target, merge_legend = TRUE)
+dev.off()
+
+svg(file.path(dir_output, "target_score_heatmap.svg"),
+    width = 13, height = max(6, nrow(target_mat) * 0.15 + 2))
+draw(ht_target, merge_legend = TRUE)
+dev.off()
+
+write.csv(target_tp, file.path(dir_output, "target_score_gsva_timepoint.csv"),
+          row.names = FALSE)
+cat("Saved: target_score_heatmap.png / .svg\n")
+```
+
+# 8. GSVA: Pathway activity (exclusive_gene_union, logistic-filtered modules)
+
+**Gene set**: `exclusive_gene_union` (DB genes − target genes) ∩ detected genes.
+Target genes are excluded to eliminate shared-gene spurious correlation with target score.
+
+```{r run_gsva_activity, message=TRUE}
+gsva_activity_mats <- list()
+
+for (tis in names(tissue_expr_raw)) {
+  cat("\n──", tis, "──\n")
+  expr_mat <- make_expr_mat(tissue_expr_raw[[tis]])
+  detected <- rownames(expr_mat)
+  mod_tis  <- module_gene_meta_filt %>% filter(tissue == tis)
+
+  if (nrow(mod_tis) == 0) { cat("  No filtered modules — skipped\n"); next }
+
+  act_sets <- setNames(
+    lapply(seq_len(nrow(mod_tis)), function(i)
+      intersect(mod_tis$exclusive_gene_union[[i]], detected)),
+    mod_tis$module_id
+  )
+  cat("  Activity sets (exclusive):",
+      sum(sapply(act_sets, length) >= 1), "valid,",
+      sum(sapply(act_sets, length) == 0), "empty\n")
+
+  res_act <- run_gsva_safe(expr_mat, act_sets, min_sz = 1)
+  if (!is.null(res_act)) gsva_activity_mats[[tis]] <- res_act
+}
+
+cat("\nGSVA pathway activity complete:", length(gsva_activity_mats), "tissues\n")
+
+activity_list <- bind_rows(lapply(names(gsva_activity_mats), function(tis) {
+  gsva_to_long(gsva_activity_mats[[tis]], tis, tissue_expr_raw[[tis]]) %>%
+    rename(activity = score)
+}))
+```
+
+# 9. Linear regression: pathway activity ~ miRNA target score
+
+Model: `activity ~ target_score + factor(timepoint)`
+
+FDR correction (BH) applied across all tissue-modules.
+
+```{r regression}
+reg_data <- activity_list %>%
+  dplyr::select(tissue, module, module_id, sample.ID, timepoint, replicate, activity) %>%
+  inner_join(
+    target_list %>% dplyr::select(tissue, module, module_id, sample.ID, target_score),
+    by = c("tissue", "module", "module_id", "sample.ID")
+  )
+
+cat("Regression data:", nrow(reg_data), "rows |",
+    n_distinct(reg_data$module_id), "tissue-modules\n\n")
+
+fit_regression <- function(df, mid) {
+  df <- df %>% filter(!is.na(activity), !is.na(target_score))
+  if (nrow(df) < 6 || var(df$target_score) < 1e-10) return(NULL)
+
+  fit_one <- function(formula, model_label) {
+    tryCatch({
+      mod <- lm(formula, data = df)
+      ct  <- summary(mod)$coefficients
+      if (!"target_score" %in% rownames(ct)) return(NULL)
+      tibble(
+        tissue    = unique(df$tissue),
+        module    = unique(df$module),
+        module_id = mid,
+        beta      = ct["target_score", "Estimate"],
+        se        = ct["target_score", "Std. Error"],
+        p_value   = ct["target_score", "Pr(>|t|)"],
+        model     = model_label,
+        n         = nrow(df)
+      )
+    }, error = function(e) NULL)
+  }
+
+  fit_one(activity ~ target_score + factor(timepoint), "factor")
+}
+
+regression_results <- bind_rows(lapply(
+  unique(reg_data$module_id),
+  function(mid) fit_regression(filter(reg_data, module_id == mid), mid)
+))
+
+regression_results <- regression_results %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+cat("Regression complete:", n_distinct(regression_results$module_id),
+    "tissue-modules |", nrow(regression_results), "rows\n\n")
+
+regression_results %>%
+  arrange(model, p_value) %>%
+  dplyr::select(model, tissue, module, module_id, beta, se, p_value, p_adj, n) %>%
+  print(n = 30)
+
+write.csv(regression_results,
+          file.path(dir_output, "regression_results.csv"), row.names = FALSE)
+cat("Saved: regression_results.csv\n")
+```
+
+# 10. Combined figure: Target score | Pathway activity | Forest plot
+
+Row order is fixed by the target score hierarchical clustering (Section 7b).
+Forest plot shows β with 95% CI from the factor model; filled circles = p_adj < 0.05.
+
+```{r combined_figure, fig.width=22, fig.height=max(6, length(row_order_combined)*0.32 + 4)}
+
+# ── Build activity matrix ───────────────────────────────────────────────────────
+act_tp <- activity_list %>%
+  group_by(tissue, module, module_id, timepoint) %>%
+  summarise(mean_activity = mean(activity, na.rm = TRUE), .groups = "drop")
+
+act_mat <- act_tp %>%
+  dplyr::select(module_id, timepoint, mean_activity) %>%
+  pivot_wider(names_from = timepoint, values_from = mean_activity) %>%
+  column_to_rownames("module_id") %>%
+  as.matrix()
+
+tp_act_cols <- TIMEPOINT_LEVELS[TIMEPOINT_LEVELS %in% colnames(act_mat)]
+act_mat     <- act_mat[, tp_act_cols, drop = FALSE]
+
+# ── Shared row order: modules present in all three result sets ──────────────────
+common_mods <- row_order_combined[
+  row_order_combined %in% rownames(act_mat) &
+  row_order_combined %in% unique(regression_results$module_id)
+]
+n_common <- length(common_mods)
+cat("Modules in combined figure:", n_common, "\n")
+
+tgt_comb <- target_mat[common_mods, , drop = FALSE]
+act_comb <- act_mat[common_mods,    , drop = FALSE]
+
+# ── Regression: factor model ─────────────────────────────────────────────────────
+reg_fct <- regression_results %>%
+  filter(model == "factor") %>%
+  dplyr::select(module_id, beta, se, p_adj)
+
+beta_vec <- setNames(reg_fct$beta,  reg_fct$module_id)[common_mods]
+se_vec   <- setNames(reg_fct$se,    reg_fct$module_id)[common_mods]
+padj_vec <- setNames(reg_fct$p_adj, reg_fct$module_id)[common_mods]
+
+ci_lo      <- beta_vec - 1.96 * se_vec
+ci_hi      <- beta_vec + 1.96 * se_vec
+x_rng      <- range(c(ci_lo, ci_hi, 0), na.rm = TRUE)
+x_rng      <- x_rng + diff(x_rng) * c(-0.15, 0.15)
+fill_vec   <- ifelse(!is.na(padj_vec) & padj_vec < 0.05, "#D73027", "grey80")
+
+# ── Left heatmap: Target score ──────────────────────────────────────────────────
+cell_sz    <- unit(6, "mm")
+tissue_ann <- sub("_mod.*$", "", common_mods)
+
+ra_tis <- rowAnnotation(
+  Tissue = tissue_ann,
+  col    = list(Tissue = tissue_pal),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(Tissue = list(title = "Tissue"))
+)
+
+ht_left <- Heatmap(
+  tgt_comb,
+  name              = "Target\nscore\n(GSVA)",
+  col               = col_fun,
+  na_col            = "grey88",
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  show_row_names    = TRUE,
+  row_names_side    = "left",
+  row_names_gp      = gpar(fontsize = 7),
+  column_names_gp   = gpar(fontsize = 9, fontface = "bold"),
+  column_title      = "Target score",
+  column_title_side = "top",
+  left_annotation   = ra_tis,
+  border            = TRUE,
+  width             = cell_sz * ncol(tgt_comb),
+  height            = cell_sz * n_common,
+  heatmap_legend_param = list(title_position = "leftcenter-rot")
+)
+
+# ── Center heatmap: Pathway activity ────────────────────────────────────────────
+ht_center <- Heatmap(
+  act_comb,
+  name              = "Pathway\nactivity\n(GSVA)",
+  col               = col_fun,
+  na_col            = "grey88",
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  show_row_names    = FALSE,
+  column_names_gp   = gpar(fontsize = 9, fontface = "bold"),
+  column_title      = "Pathway activity",
+  column_title_side = "top",
+  border            = TRUE,
+  width             = cell_sz * ncol(act_comb),
+  height            = cell_sz * n_common,
+  heatmap_legend_param = list(title_position = "leftcenter-rot")
+)
+
+# ── Right: Forest plot — implemented as a dummy heatmap body ────────────────────
+# All NA cells render as white; grid drawing inside decorate_heatmap_body adds
+# the CI bars and points.  This approach keeps all three panels in one HeatmapList
+# so row heights are guaranteed to be identical.
+forest_mat <- matrix(NA_real_, nrow = n_common, ncol = 1,
+                     dimnames = list(common_mods, "β"))
+
+ht_right <- Heatmap(
+  forest_mat,
+  name                  = "forest_bg",
+  col                   = colorRamp2(c(0, 1), c("white", "white")),
+  na_col                = "white",
+  cluster_rows          = FALSE,
+  cluster_columns       = FALSE,
+  show_row_names        = FALSE,
+  show_heatmap_legend   = FALSE,
+  column_names_gp       = gpar(fontsize = 9, fontface = "bold"),
+  column_title          = "β (95% CI)\n(factor model)",
+  column_title_side     = "top",
+  border                = TRUE,
+  width                 = unit(50, "mm"),
+  height                = cell_sz * n_common
+)
+
+ht_all <- ht_left + ht_center + ht_right
+
+# ── Draw and decorate ───────────────────────────────────────────────────────────
+draw_combined <- function() {
+  draw(ht_all, merge_legend = TRUE,
+       column_title    = "Logistic-filtered modules (OR > 1, p_adj < 0.05)",
+       column_title_gp = gpar(fontsize = 12, fontface = "bold"))
+
+  # In decorate_heatmap_body the y viewport matches the heatmap body:
+  # row i of common_mods (1 = top) sits at native y = n_common + 1 - i
+  # with yscale = c(0.5, n_common + 0.5).
+  decorate_heatmap_body("forest_bg", {
+    pushViewport(viewport(xscale = x_rng,
+                          yscale = c(0.5, n_common + 0.5)))
+
+    # Zero reference line
+    grid.lines(x  = unit(c(0, 0), "native"),
+               y  = unit(c(0.5, n_common + 0.5), "native"),
+               gp = gpar(col = "grey50", lty = "dashed", lwd = 1))
+
+    for (i in seq_len(n_common)) {
+      if (is.na(beta_vec[i])) next
+      y_pos <- n_common + 1 - i
+
+      # CI bar
+      grid.segments(
+        x0 = unit(ci_lo[i], "native"), y0 = unit(y_pos, "native"),
+        x1 = unit(ci_hi[i], "native"), y1 = unit(y_pos, "native"),
+        gp = gpar(col = "grey40", lwd = 1.5)
+      )
+      # Point
+      grid.points(
+        x    = unit(beta_vec[i], "native"),
+        y    = unit(y_pos,       "native"),
+        pch  = 21,
+        size = unit(2.5, "mm"),
+        gp   = gpar(fill = fill_vec[i], col = "grey20", lwd = 0.8)
+      )
+    }
+
+    grid.xaxis(gp = gpar(fontsize = 7))
+    popViewport()
+  })
+}
+
+draw_combined()
+
+png_h <- max(1200, n_common * 30 + 500)
+png(file.path(dir_output, "combined_figure.png"), width = 4400, height = png_h, res = 200)
+draw_combined()
+dev.off()
+
+svg(file.path(dir_output, "combined_figure.svg"),
+    width = 22, height = max(6, n_common * 0.32 + 4))
+draw_combined()
+dev.off()
+
+cat("Saved: combined_figure.png / .svg  (n =", n_common, "modules)\n")
+```
+
+```{r combined_figure_summary}
+cat("=== Significant regression results in combined figure (factor model, p_adj < 0.05) ===\n")
+regression_results %>%
+  filter(model == "factor", module_id %in% common_mods, p_adj < 0.05) %>%
+  arrange(p_adj) %>%
+  dplyr::select(tissue, module, module_id, beta, se, p_value, p_adj, n) %>%
+  print(n = Inf)
+```
+
+# Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

@@ -1,0 +1,428 @@
+---
+title: "Changes of miRNAs in plasma of DIO mice (cohort7)"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.height = 9,
+	fig.width = 16,
+	dpi = 300
+)
+```
+
+# Sample background
+
+C57BL/6J male mice fed of 60 kcal% HFD (D12492, ResearchDiet) for various weeks from 8 weeks old. Plasma was collected with K2-EDTA at the sacrifice after HFD feeding for 0, 1 day, 3 days, 1, 2, 4, 6, 8, 10, or 12 weeks: cohort number 7 ). Five samples out of 7-10 mice in each group were selected according to the body weight close to the median of each group except samples with lacking enough for the following assays, low hematocrit or cyst of kidney. MicroRNAs were analyzed by Takara (PR4436).
+
+# Library
+
+```{r library, echo=TRUE, warning=FALSE, message=FALSE}
+
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(patchwork)
+library(DT)
+
+```
+
+# 1. Data loading
+
+```{r data loading, echo=TRUE}
+
+data <- read.csv(file = "\\\\tsclient/H/Results/dataset/PR4436_miRNA-seq_cohort7/table/PR4436_expression.csv", header = T) %>% 
+  as.data.frame()
+
+# Extract TPM count matrix of mature miRNAs
+data <- subset(data, data$RNA_type == "miRNA_mature")
+data <- data[,c(1,2,4,55:104)]
+head(data, n = 10)
+
+datasheet <- read.csv(file = "\\\\tsclient/H/Results/dataset/PR4436_miRNA-seq_cohort7/datasheet/PR4436_datasheet.csv", header = T) %>% 
+  as.data.frame()
+
+list.sample <- read.csv(file = "\\\\tsclient/H/Results/dataset/PR4436_miRNA-seq_cohort7/Cohort7_selected_sample_list_for_trans-omics_analyses.csv", header = T)
+list.sample <- list.sample[1:50,1:4]
+
+list.sample <- left_join(x = list.sample,
+                         y = datasheet,
+                         by = "sample.name")
+list.sample$sample.ID <- stringr::str_remove(basename(list.sample$sample.ID), pattern = "_c$")
+
+str(list.sample)
+
+rm(datasheet)
+```
+
+# 2. QC
+
+Remove transcripts that does not express at leaset three biological replicates in each category (weeks of HFD treatment).
+
+## 2.1. Formatting data
+
+```{r formatting, echo=TRUE}
+
+# Formatting data
+data <- column_to_rownames(data, var = "Transcript_ID")
+data <- data[,3:52] 
+
+data.t <- t(data) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "sample.ID")
+
+data.t$sample.ID <- stringr::str_remove(basename(data.t$sample.ID),
+                                         pattern = "_c\\.TPM$")
+
+data.t <- left_join(x = data.t, y = list.sample, by = "sample.ID")
+data.t$MouseID <- as.character(data.t$MouseID)
+
+data.long <- data.t %>%
+  pivot_longer(
+    cols = where(is.numeric),  # all columns except sample.ID and Category
+    names_to = "Transcript.ID",
+    values_to = "TPM"
+  )
+
+head(data.long)
+
+# Boxplot
+ggplot(data.long, aes(x = sample.ID,
+                       y = log10(1+TPM))) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = "Expression distribution per sample",
+       x = "Sample ID",
+       y = "Log10(1+TPM)")
+  
+```
+
+## 2.2. QC
+
+```{r QC, echo=TRUE}
+
+data.long_filtered <- data.long %>% 
+  
+  # group by Treatment AND Gene
+  group_by(Treatment, Transcript.ID) %>%   
+  
+  # count how many samples > 10
+  summarise(n_expressed = sum(TPM > 10), .groups = "drop") %>%  
+  
+  # keep if >= 5 samples in any Treatment group
+  filter(n_expressed >= 5) %>%    
+  
+  # only keep gene names
+  distinct(Transcript.ID)                   
+
+data.clean <- data.long %>%
+  filter(Transcript.ID %in% data.long_filtered$Transcript.ID)
+
+
+# Boxplot
+ggplot(data.clean, aes(x = sample.ID,
+                       y = log10(1+TPM))) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = "Expression distribution per sample after filteration",
+       x = "Sample ID",
+       y = "Log10(1+TPM)")
+
+
+# Examples of expression changes across treatment conditions
+p1 <- data.clean %>% 
+  filter(Transcript.ID == "mmu-let-7a-1-3p") %>% 
+  ggplot(aes(x = Treatment, y = log2(1+TPM), fill = Treatment)) +
+  geom_boxplot() +
+  theme_bw() +
+  ylim(0, NA) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(title = "Expression of mmu-let-7a-1-3p",
+       x = "Treatment",
+       y = "log2(1+TPM)")
+
+	
+p2 <- data.clean %>% 
+  filter(Transcript.ID == "mmu-miR-320-3p") %>% 
+  ggplot(aes(x = Treatment, y = log2(1+TPM), fill = Treatment)) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(title = "Expression of mmu-miR-320-3p",
+       x = "Treatment",
+       y = "log2(1+TPM)")
+
+p1 + p2
+
+```
+
+## 2.3. Reformatting
+
+```{r reformatting, echo=TRUE}
+data.clean$sample.ID2 <- 
+  paste0(data.clean$Treatment, "_", data.clean$MouseID)
+
+
+data.clean_matrix <- data.clean %>%
+  select(sample.ID2, Transcript.ID, TPM) %>% 
+  pivot_wider(
+    names_from = sample.ID2,
+    values_from = TPM
+  ) %>%
+  column_to_rownames("Transcript.ID") %>%
+  as.matrix()
+
+write.csv(data.clean_matrix, 
+          file = "F:/wd/cohort7_miRNAs/cohort7_miRNAs/output/data.clean_matrix.csv")
+```
+
+```{r pca, echo=TRUE}
+
+# Transpose to have samples in rows for PCA
+result.pca <- prcomp(t(data.clean_matrix), scale. = TRUE)
+
+# Make a data frame of PCA results
+df.pca <- as.data.frame(result.pca$x)  # PC1, PC2, ...
+
+p3 <- ggplot(df.pca, aes(x = PC1, y = PC2, label = rownames(df.pca))) +
+  #geom_point(aes(color = some_group)) +  # Optional group color
+  geom_text(vjust = -0.5, size = 3) +    # Optional labels
+  #theme_minimal() +
+  labs(title = "PCA of Samples", x = "PC1", y = "PC2") +
+  theme(aspect.ratio = 1/1)
+
+tiff(filename = file.path(dir.output, "pca.tiff"),
+     width = 1600, height = 1600, res = 300)
+print(p3)
+dev.off()
+
+png(filename = file.path(dir.output, "pca.png"),
+     width = 1600, height = 1600, res = 300)
+print(p3)
+dev.off()
+```
+
+# 3. Scaling
+
+```{r scaling, echo=TRUE}
+
+# Scaling
+data.scaled <- data.clean %>% 
+  group_by(Transcript.ID) %>% 
+  mutate(scaled.tpm = as.vector(scale(x = TPM, 
+                                      center = TRUE, 
+                                      scale = TRUE))) %>% 
+  arrange(sample.ID2)
+
+
+summary <- data.scaled %>% 
+  group_by(Transcript.ID) %>% 
+  summarise(max = max(scaled.tpm),
+            median = median(scaled.tpm),
+            min = min(scaled.tpm))
+
+data.scaled %>% 
+  subset(Transcript.ID == c("mmu-miR-320-3p",
+                            "mmu-let-7a-1-3p",
+                            "mmu-miR-3968")) %>% 
+
+ggplot(aes(x = scaled.tpm)) +
+       geom_histogram(binwidth = 0.2, 
+                      fill = "blue", 
+                      alpha = 0.1, 
+                      color = "black") +
+       facet_wrap(~ Transcript.ID, scales = "free") +  # Separate histogram for each Assay
+       theme_minimal() 
+  
+```
+
+# 4. Heatmap
+
+```{r heatmap, echo=TRUE}
+
+## Format conversion to matrix
+mat.scaled <- 
+  data.scaled[,c("sample.ID2", "Transcript.ID", "scaled.tpm")] %>%
+  pivot_wider(names_from = sample.ID2,
+              values_from = scaled.tpm) %>% 
+  column_to_rownames(var = "Transcript.ID") %>% 
+  t()
+
+samples <- rownames(mat.scaled)
+timepoints <- sub("_.*","", samples) 
+desired_order <- c("0d", "1d", "3d", "1wk", "2wk", "4wk", "6wk", "8wk", "10wk", "12wk")
+
+time_factor <- factor(timepoints, levels = desired_order, ordered = TRUE)
+
+mat.scaled_ordered <- 
+  mat.scaled[order(time_factor, samples), , drop = FALSE]
+
+
+column_category <- data.scaled[,c("sample.ID2", "Treatment")] %>% 
+  as.data.frame() %>% 
+  distinct() %>% 
+  column_to_rownames(var = "sample.ID2")
+
+treatment_condition <- c("0d", 
+                         "1d", 
+                         "3d", 
+                         "1wk", 
+                         "2wk", 
+                         "4wk", 
+                         "6wk", 
+                         "8wk", 
+                         "10wk",
+                         "12wk"
+                         )
+
+column_category$Treatment <- factor(column_category$Treatment,
+                                    levels = treatment_condition)
+
+category_colors <- structure(c("12wk" = "#000004FF",
+                               "10wk" = "#180F3EFF",
+                               "8wk" = "#451077FF",
+                               "6wk" = "#721F81FF",
+                               "4wk" = "#9F2F7FFF",
+                               "2wk" = "#CD4071FF",
+                               "1wk" = "#F1605DFF",
+                               "3d" = "#FD9567FF",
+                               "1d" = "#FEC98DFF",
+                               "0d" = "#FCFDBFFF")) 
+
+category_anno <- rowAnnotation(wks_HFD = column_category$Treatment, 
+                               col = list(wks_HFD = category_colors)
+                               )
+
+heatmap <- Heatmap(mat.scaled,
+            cluster_rows = FALSE,
+            cluster_columns = hclust(dist(t(mat.scaled)), 
+                                     method = "ward.D2"),
+            column_split = 7,
+            show_row_names = TRUE,
+            row_split = column_category,
+            left_annotation = category_anno,
+            )
+
+print(heatmap)
+
+# Save output
+wd <- getwd()
+dir.output <- file.path(wd, "output")
+if(!dir.exists(dir.output)){dir.create(dir.output)}
+
+tiff(file.path(dir.output, "heatmap_miRNAs.tiff"),
+     width = 16000,
+     height = 4500,
+     res = 300,
+     compression = "lzw")
+grid.newpage()
+draw(heatmap)
+dev.off()
+
+svg(filename = file.path(dir.output, "heatmap.svg"),
+     width = 16,
+     height = 9)
+grid.newpage()
+draw(heatmap)
+dev.off()
+
+
+col_order_indices <- unlist(column_order(heatmap))
+col_order_names <- colnames(scaled_mat)[col_order_indices]
+
+```
+
+# 5. Selected miRs
+
+```{r}
+
+list.selected <- read_csv("\\\\tsclient/H/Results/R_wd/DNB_cohort7/mirna/miRNAs_origin_PMID33772227.csv")
+```
+
+```{r}
+
+match_mirna <- function(query, target) {
+  result <- unlist(lapply(query, function(q) {
+    if (grepl("[0-9][a-z]$", q)) {
+      # Case 1: query ends with lowercase after number → exact match only
+      matched <- target[grepl(paste0("^", q, "(-3p|-5p)?$"), target)]
+    } else {
+      # Case 2: base name → match all starting with it (allow suffix letter and strand)
+      matched <- target[grepl(paste0("^", q, "[a-z]?(-3p|-5p)?$"), target)]
+    }
+    matched
+  }))
+  unique(result)
+}
+
+query <- rownames(binary_matrix)
+query_clean <- gsub("^mmu-", "", query)
+
+target <- gsub("^mmu-", "", colnames(mat.scaled))  # if needed
+
+matched <- match_mirna(query_clean, target)
+mat.scaled_subset <- mat.scaled[, colnames(mat.scaled) %in% paste0("mmu-", matched), drop = FALSE]
+
+
+binary_matrix <- read_csv("\\\\tsclient/H/Results/R_wd/DNB_cohort7/mirna/bottom_anno_binary_mat.csv")
+binary_matrix <- as.data.frame(binary_matrix) %>% 
+  column_to_rownames("mirNa")
+
+binary_named_fct <- binary_matrix
+for (tissue in colnames(binary_named_fct)) {
+  binary_named_fct[[tissue]] <- ifelse(binary_named_fct[[tissue]] == 1, tissue, NA)
+}
+
+
+binary_matrix_aligned <- binary_named_fct[colnames(mat.scaled_subset), , drop = FALSE]
+
+all(rownames(binary_matrix_aligned) == colnames(mat.scaled_subset)) 
+
+bottom_anno <- HeatmapAnnotation(
+  df = binary_matrix_aligned,
+  col = list(
+    muscle = c("muscle" = "red"),
+    `β-cells of pancreas` = c("β-cells of pancreas" = "blue"),
+    liver = c("liver" = "green"),
+    `adipose tissue` = c("adipose tissue" = "orange")
+  ),
+  na_col = "white",
+  which = "column"
+)
+
+
+
+heatmap <- Heatmap(mat.scaled_subset,
+            cluster_rows = FALSE,
+            cluster_columns = hclust(dist(t(mat.scaled_subset)), 
+                                     method = "ward.D2"),
+            column_split = 7,
+            show_row_names = FALSE,
+            row_split = column_category,
+            left_annotation = category_anno,
+            bottom_annotation = bottom_anno
+            )
+
+plot(heatmap)
+
+# Save output
+wd <- getwd()
+dir.output <- file.path(wd, "output")
+if(!dir.exists(dir.output)){dir.create(dir.output)}
+
+tiff(file.path(dir.output, "heatmap_selected_miRNAs.tiff"),
+     width = 4000,
+     height = 3000,
+     res = 300,
+     compression = "lzw")
+grid.newpage()
+draw(heatmap)
+dev.off()
+```

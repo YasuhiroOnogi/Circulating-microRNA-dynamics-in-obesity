@@ -1,0 +1,579 @@
+---
+title: "02.1 — Target mRNA Jaccard index: hsa vs mmu homologous miRNA pairs"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.height = 5, fig.width = 8, dpi = 150)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(org.Mm.eg.db)
+library(homologene)   # mmu <-> hsa ortholog mapping (NCBI HomoloGene build 68)
+library(ggrepel)
+```
+
+# 2. Parameters
+
+```{r params}
+dir_ref  <- "F:/wd/cohort7_miRNAs/ref"
+dir_02   <- "F:/wd/cohort7_miRNAs/external validation/output/02_GSE155096_homolog"
+dir_out  <- "F:/wd/cohort7_miRNAs/external validation/output/02.1_target_Jaccard"
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+ts_dir_hsa <- file.path(dir_ref, "TargetScan_v8.0", "human")
+ts_dir_mmu <- file.path(dir_ref, "TargetScan_v8.0", "mouse")
+mirdb_path <- file.path(dir_ref, "miRDB_v6.0_prediction_result.txt")
+
+cat("Output dir:", dir_out, "\n")
+```
+
+# 3. Load homologous miRNA pairs
+
+Reuse the pairs identified in script 02 (mouse maSigPro miRNAs matched to GSE155096
+human homologs). Each row is one unique (mmu_miRNA, hsa_miRNA) pair.
+
+```{r load-pairs}
+pairs_raw <- read.csv(file.path(dir_02, "homolog_pairs_matched_in_GSE155096.csv"),
+                      stringsAsFactors = FALSE)
+
+pairs <- pairs_raw %>%
+  distinct(mmu_miRNA, hsa_miRNA, miRNA_cluster, miR_family, conservation)
+
+cat("Unique mmu miRNAs:", n_distinct(pairs$mmu_miRNA), "\n")
+cat("Unique hsa miRNAs:", n_distinct(pairs$hsa_miRNA), "\n")
+cat("Total pairs      :", nrow(pairs), "\n")
+print(pairs)
+```
+
+# 4. TargetScan: miRNA name → miR Family lookup
+
+TargetScan predictions are stored by *miR Family*, not individual miRNA names.
+Build a lookup table from the miR_Family_Info files.
+
+```{r ts-family-lookup}
+read_family_info <- function(path) {
+  read.delim(path, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE) %>%
+    dplyr::select(
+      mirna_name = `MiRBase ID`,
+      mir_family = `miR family`
+    )
+}
+
+family_hsa <- read_family_info(file.path(ts_dir_hsa, "miR_Family_Info_hsa.txt"))
+family_mmu <- read_family_info(file.path(ts_dir_mmu, "miR_Family_Info_mmu.txt"))
+
+cat("hsa family entries:", nrow(family_hsa), "\n")
+cat("mmu family entries:", nrow(family_mmu), "\n")
+```
+
+# 5. TargetScan: load predicted target genes
+
+Load all predicted targets (no score filter) and keep only Gene Symbol + miR Family.
+
+```{r ts-targets}
+read_ts_targets <- function(path) {
+  read.delim(path, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE) %>%
+    dplyr::select(
+      mir_family  = `miR Family`,
+      gene_symbol = `Gene Symbol`
+    ) %>%
+    filter(!is.na(gene_symbol), gene_symbol != "") %>%
+    distinct()
+}
+
+ts_hsa <- read_ts_targets(file.path(ts_dir_hsa, "Predicted_Targets_Info_hsa.txt"))
+ts_mmu <- read_ts_targets(file.path(ts_dir_mmu, "Predicted_Targets_Info_mmu.txt"))
+
+cat("TargetScan hsa records:", nrow(ts_hsa),
+    " | unique families:", n_distinct(ts_hsa$mir_family), "\n")
+cat("TargetScan mmu records:", nrow(ts_mmu),
+    " | unique families:", n_distinct(ts_mmu$mir_family), "\n")
+```
+
+# 6. miRDB: load predictions and map RefSeq → gene symbol
+
+miRDB v6.0 stores targets as RefSeq NM_ accessions (version-stripped).
+Map to gene symbols using org.Hs.eg.db / org.Mm.eg.db.
+
+```{r mirdb-load}
+mirdb_raw <- read.delim(mirdb_path, header = TRUE, stringsAsFactors = FALSE,
+                        col.names = c("mirna_name", "refseq", "score")) %>%
+  mutate(refseq_base = sub("\\.\\d+$", "", refseq))  # strip version suffix
+
+mirdb_hsa_raw <- mirdb_raw %>%
+  filter(startsWith(mirna_name, "hsa-")) %>%
+  distinct(mirna_name, refseq_base)
+
+mirdb_mmu_raw <- mirdb_raw %>%
+  filter(startsWith(mirna_name, "mmu-")) %>%
+  distinct(mirna_name, refseq_base)
+
+cat("miRDB hsa entries:", nrow(mirdb_hsa_raw), "\n")
+cat("miRDB mmu entries:", nrow(mirdb_mmu_raw), "\n")
+```
+
+```{r mirdb-map-hsa}
+hsa_refseqs <- unique(mirdb_hsa_raw$refseq_base)
+hsa_sym_map <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys    = hsa_refseqs,
+  keytype = "REFSEQ",
+  column  = "SYMBOL",
+  multiVals = "first"
+)
+hsa_sym_df <- tibble(
+  refseq_base = names(hsa_sym_map),
+  gene_symbol = unname(hsa_sym_map)
+) %>% filter(!is.na(gene_symbol))
+
+mirdb_hsa <- mirdb_hsa_raw %>%
+  left_join(hsa_sym_df, by = "refseq_base") %>%
+  filter(!is.na(gene_symbol)) %>%
+  distinct(mirna_name, gene_symbol)
+
+cat("miRDB hsa: mapped", nrow(mirdb_hsa), "mirna–gene pairs",
+    "(", round(nrow(mirdb_hsa) / nrow(mirdb_hsa_raw) * 100, 1), "% of entries)\n")
+```
+
+```{r mirdb-map-mmu}
+mmu_refseqs <- unique(mirdb_mmu_raw$refseq_base)
+mmu_sym_map <- AnnotationDbi::mapIds(
+  org.Mm.eg.db,
+  keys    = mmu_refseqs,
+  keytype = "REFSEQ",
+  column  = "SYMBOL",
+  multiVals = "first"
+)
+mmu_sym_df <- tibble(
+  refseq_base = names(mmu_sym_map),
+  gene_symbol = unname(mmu_sym_map)
+) %>% filter(!is.na(gene_symbol))
+
+mirdb_mmu <- mirdb_mmu_raw %>%
+  left_join(mmu_sym_df, by = "refseq_base") %>%
+  filter(!is.na(gene_symbol)) %>%
+  distinct(mirna_name, gene_symbol)
+
+cat("miRDB mmu: mapped", nrow(mirdb_mmu), "mirna–gene pairs",
+    "(", round(nrow(mirdb_mmu) / nrow(mirdb_mmu_raw) * 100, 1), "% of entries)\n")
+```
+
+# 7. Build mmu → hsa ortholog map
+
+Convert all mouse gene symbols collected from TargetScan and miRDB to their
+human ortholog symbols using NCBI HomoloGene (via the `homologene` package).
+This correctly handles pairs with different symbols (e.g., Trp53 → TP53).
+Mouse genes without a recorded human ortholog are excluded from the mmu target
+set, so Jaccard is computed entirely in hsa gene symbol space.
+
+```{r ortholog-map}
+# Collect unique mouse gene symbols in their ORIGINAL case.
+# homologene() does case-sensitive matching against MGI symbols (e.g. "Gapdh"),
+# so toupper() must NOT be applied before the lookup.
+all_mmu_symbols <- unique(c(
+  ts_mmu$gene_symbol,
+  mirdb_mmu$gene_symbol
+))
+cat("Unique mmu gene symbols to map:", length(all_mmu_symbols), "\n")
+
+# homologene() returns a data.frame; column names are the taxon IDs as strings
+# inTax = 10090 (Mus musculus), outTax = 9606 (Homo sapiens)
+ortho_raw <- homologene(all_mmu_symbols, inTax = 10090, outTax = 9606)
+
+ortho_map <- ortho_raw %>%
+  dplyr::rename(mmu_symbol = `10090`, hsa_symbol = `9606`) %>%
+  filter(mmu_symbol != "", hsa_symbol != "") %>%
+  distinct(mmu_symbol, hsa_symbol)
+
+cat("mmu symbols mapped to hsa orthologs:", n_distinct(ortho_map$mmu_symbol),
+    "/", length(all_mmu_symbols), "\n")
+cat("Coverage:", round(n_distinct(ortho_map$mmu_symbol) /
+                         length(all_mmu_symbols) * 100, 1), "%\n")
+
+# Build lookup with toupper() keys so get_targets_mmu() can query case-insensitively
+ortho_vec <- setNames(ortho_map$hsa_symbol, toupper(ortho_map$mmu_symbol))
+```
+
+# 8. Build target gene sets per individual miRNA (hsa symbol space)
+
+Union of TargetScan (family-level) and miRDB (individual miRNA-level) targets.
+mmu gene symbols are converted to hsa orthologs so Jaccard is computed in the
+same (hsa) gene symbol space for both species.
+
+```{r build-target-sets}
+get_targets_hsa <- function(mirna) {
+  fam <- family_hsa %>% filter(mirna_name == mirna) %>% pull(mir_family)
+
+  ts_genes <- if (length(fam) > 0) {
+    ts_hsa %>% filter(mir_family %in% fam) %>% pull(gene_symbol)
+  } else character(0)
+
+  db_genes <- mirdb_hsa %>% filter(mirna_name == mirna) %>% pull(gene_symbol)
+
+  toupper(unique(c(ts_genes, db_genes)))
+}
+
+# mmu target genes are converted to hsa ortholog symbols via ortho_vec.
+# Genes without a known human ortholog are silently excluded, so both sets
+# live in hsa gene symbol space — enabling direct Jaccard comparison.
+get_targets_mmu <- function(mirna) {
+  fam <- family_mmu %>% filter(mirna_name == mirna) %>% pull(mir_family)
+
+  ts_genes <- if (length(fam) > 0) {
+    ts_mmu %>% filter(mir_family %in% fam) %>% pull(gene_symbol)
+  } else character(0)
+
+  db_genes <- mirdb_mmu %>% filter(mirna_name == mirna) %>% pull(gene_symbol)
+
+  mmu_syms <- toupper(unique(c(ts_genes, db_genes)))
+  # Map to hsa ortholog symbols; drop unmapped entries (NA)
+  hsa_syms <- ortho_vec[mmu_syms]
+  unique(hsa_syms[!is.na(hsa_syms)])
+}
+
+jaccard <- function(a, b) {
+  if (length(a) == 0 && length(b) == 0) return(NA_real_)
+  length(intersect(a, b)) / length(union(a, b))
+}
+
+# Pre-compute target sets for unique miRNAs (avoid redundant I/O)
+unique_hsa <- unique(pairs$hsa_miRNA)
+unique_mmu <- unique(pairs$mmu_miRNA)
+
+cat("Computing target sets for", length(unique_hsa), "hsa and",
+    length(unique_mmu), "mmu miRNAs...\n")
+
+hsa_targets <- setNames(lapply(unique_hsa, get_targets_hsa), unique_hsa)
+mmu_targets <- setNames(lapply(unique_mmu, get_targets_mmu), unique_mmu)
+
+# Target set size summary
+ts_sizes <- bind_rows(
+  tibble(species = "hsa",
+         mirna   = names(hsa_targets),
+         n_targets = lengths(hsa_targets)),
+  tibble(species = "mmu",
+         mirna   = names(mmu_targets),
+         n_targets = lengths(mmu_targets))
+)
+cat("\nTarget set sizes:\n")
+print(ts_sizes)
+```
+
+# 9. Compute Jaccard index per pair
+
+```{r compute-jaccard}
+# Alias the external lists to avoid name collision with mutate column assignments
+.hsa <- hsa_targets
+.mmu <- mmu_targets
+
+jaccard_res <- pairs %>%
+  rowwise() %>%
+  mutate(
+    n_hsa         = length(.hsa[[hsa_miRNA]]),
+    n_mmu         = length(.mmu[[mmu_miRNA]]),
+    n_intersect   = length(intersect(.hsa[[hsa_miRNA]], .mmu[[mmu_miRNA]])),
+    n_union       = length(union(.hsa[[hsa_miRNA]], .mmu[[mmu_miRNA]])),
+    jaccard_index = jaccard(.hsa[[hsa_miRNA]], .mmu[[mmu_miRNA]])
+  ) %>%
+  ungroup() %>%
+  arrange(desc(jaccard_index))
+
+cat("Jaccard index results:\n")
+print(as_tibble(jaccard_res), n = Inf)
+
+write.csv(jaccard_res,
+          file.path(dir_out, "jaccard_hsa_mmu_target_overlap.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: jaccard_hsa_mmu_target_overlap.csv\n")
+```
+
+# 10. Visualization
+
+## 10a. Jaccard index barplot (horizontal, miRNAs on y-axis)
+
+Pairs are ordered by Jaccard index (ascending → highest at top after coord_flip).
+Significant pairs in the GSE155096 C vs T comparison (script 02) are marked:
+`*` p < 0.05, `**` FDR < 0.05. Significant y-axis labels are shown in bold.
+
+```{r plot-jaccard-bar, fig.height=6, fig.width=8}
+MIRNA_CLUSTER_COLORS <- c(
+  "1" = "#B3E2CD", "2" = "#FDCDAC", "3" = "#CBD5E8",
+  "4" = "#F4CAE4", "5" = "#FFF2AE"
+)
+
+# Load C vs T significance from script 02 output
+cvst_sig <- read.csv(file.path(dir_02, "CvsT_stats.csv"),
+                     stringsAsFactors = FALSE) %>%
+  dplyr::select(mmu_miRNA, hsa_miRNA, sig, p_value, p_adj)
+
+# Join significance to Jaccard results and build plot data
+plot_jac <- jaccard_res %>%
+  left_join(cvst_sig, by = c("mmu_miRNA", "hsa_miRNA")) %>%
+  mutate(
+    sig        = replace_na(sig, "n.s."),
+    sig_mark   = case_when(
+      sig == "FDR < 0.05" ~ "**",
+      sig == "p < 0.05"   ~ "*",
+      TRUE                ~ ""
+    ),
+    # Label: "mmu / hsa  **"  (marker appended with space)
+    pair_label = paste0(
+      sub("^mmu-", "", mmu_miRNA), " / ", sub("^hsa-", "", hsa_miRNA),
+      ifelse(sig_mark != "", paste0("  ", sig_mark), "")
+    ),
+    miRNA_cluster = factor(as.character(miRNA_cluster), levels = 1:5),
+    is_sig = sig != "n.s."
+  ) %>%
+  # Ascending Jaccard order → highest bar at top after coord_flip
+  arrange(jaccard_index) %>%
+  mutate(pair_label = factor(pair_label, levels = unique(pair_label)))
+
+# Build axis label color vector (bold face for significant pairs)
+label_face  <- ifelse(plot_jac$is_sig, "bold", "plain")
+label_color <- ifelse(plot_jac$is_sig, "black", "grey40")
+
+jac_max <- max(plot_jac$jaccard_index, na.rm = TRUE)
+
+p_bar <- ggplot(plot_jac,
+                aes(y = pair_label, x = jaccard_index, fill = miRNA_cluster)) +
+  geom_col(width = 0.7, color = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(jaccard_index, 3)),
+            hjust = -0.15, size = 3, color = "grey20") +
+  scale_fill_manual(name   = "Mouse\ncluster",
+                    values = MIRNA_CLUSTER_COLORS) +
+  scale_x_continuous(limits = c(0, jac_max * 1.18),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_y_discrete() +
+  labs(
+    title    = "Jaccard index of target mRNAs: hsa vs mmu homologous miRNA pairs",
+    subtitle = paste0("Targets = union of TargetScan v8.0 and miRDB v6.0 (no score filter)\n",
+                      "* p < 0.05,  ** FDR < 0.05  (GSE155096 C vs T)"),
+    y        = NULL,
+    x        = "Jaccard index"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(color = "grey40", hjust = 0.5, size = 9),
+    axis.text.y        = element_text(face  = label_face,
+                                      color = label_color,
+                                      size  = 9),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+print(p_bar)
+
+n_pairs <- nrow(plot_jac)
+bar_h   <- max(4, n_pairs * 0.38 + 1.5)
+
+ggsave(file.path(dir_out, "jaccard_barplot.svg"), p_bar, width = 8, height = bar_h)
+ggsave(file.path(dir_out, "jaccard_barplot.png"), p_bar, width = 8, height = bar_h,
+       dpi = 300)
+cat("Saved: jaccard_barplot.svg / .png\n")
+```
+
+## 10b. Target set size vs Jaccard index (bubble plot)
+
+```{r plot-bubble, fig.height=5, fig.width=7}
+plot_bub <- jaccard_res %>%
+  mutate(
+    pair_label    = paste0(sub("^mmu-", "", mmu_miRNA), " / ",
+                           sub("^hsa-", "", hsa_miRNA)),
+    miRNA_cluster = factor(as.character(miRNA_cluster), levels = 1:5)
+  )
+
+p_bub <- ggplot(plot_bub,
+                aes(x = n_hsa, y = n_mmu,
+                    color = miRNA_cluster, size = jaccard_index)) +
+  geom_point(alpha = 0.8) +
+  geom_text_repel(aes(label = pair_label), size = 3,
+                  max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(name   = "Mouse\ncluster",
+                     values = MIRNA_CLUSTER_COLORS) +
+  scale_size_continuous(name   = "Jaccard\nindex",
+                        range  = c(3, 12),
+                        breaks = c(0.1, 0.3, 0.5, 0.7)) +
+  labs(
+    title    = "Target set size vs Jaccard index",
+    subtitle = "Dot size = Jaccard index; axes = number of predicted targets",
+    x        = "# hsa targets (TargetScan + miRDB union)",
+    y        = "# mmu targets (TargetScan + miRDB union)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(color = "grey40", hjust = 0.5, size = 9)
+  )
+
+print(p_bub)
+
+ggsave(file.path(dir_out, "jaccard_bubble.svg"), p_bub, width = 7, height = 5)
+ggsave(file.path(dir_out, "jaccard_bubble.png"), p_bub, width = 7, height = 5,
+       dpi = 300)
+cat("Saved: jaccard_bubble.svg / .png\n")
+```
+
+## 10c. Target overlap composition barplot
+
+Stacked bar showing the number of targets in each component
+(hsa-only, shared, mmu-only) per pair. Both columns are in hsa gene symbol space.
+
+```{r plot-overlap-stack, fig.height=5, fig.width=9}
+overlap_long <- jaccard_res %>%
+  mutate(
+    pair_label    = paste0(sub("^mmu-", "", mmu_miRNA), " / ",
+                           sub("^hsa-", "", hsa_miRNA)),
+    pair_label    = factor(pair_label,
+                           levels = pair_label[order(jaccard_index)]),
+    n_hsa_only    = n_hsa - n_intersect,
+    n_mmu_only    = n_mmu - n_intersect
+  ) %>%
+  dplyr::select(pair_label, n_hsa_only, n_intersect, n_mmu_only) %>%
+  pivot_longer(-pair_label,
+               names_to  = "component",
+               values_to = "count") %>%
+  mutate(component = factor(component,
+                             levels  = c("n_hsa_only", "n_intersect", "n_mmu_only"),
+                             labels  = c("hsa only", "shared", "mmu only")))
+
+p_stack <- ggplot(overlap_long,
+                  aes(x = pair_label, y = count, fill = component)) +
+  geom_col(width = 0.75, color = "white", linewidth = 0.3) +
+  scale_fill_manual(
+    name   = "Target\ncategory",
+    values = c("hsa only" = "#4393c3",
+               "shared"   = "#74c476",
+               "mmu only" = "#d6604d")
+  ) +
+  labs(
+    title    = "Target mRNA overlap: hsa-only / shared / mmu-only",
+    subtitle = "Ordered by Jaccard index (ascending)",
+    x        = "miRNA pair (mmu / hsa)",
+    y        = "# target genes"
+  ) +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(color = "grey40", hjust = 0.5, size = 9),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+print(p_stack)
+
+ggsave(file.path(dir_out, "target_overlap_stacked.svg"), p_stack,
+       width = 9, height = 5)
+ggsave(file.path(dir_out, "target_overlap_stacked.png"), p_stack,
+       width = 9, height = 5, dpi = 300)
+cat("Saved: target_overlap_stacked.svg / .png\n")
+```
+
+# 11. Source breakdown per miRNA
+
+How many targets came from TargetScan vs miRDB for each miRNA.
+Note: mmu counts reflect the number of ortholog-mapped hsa symbols (after filtering unmapped genes).
+
+```{r source-breakdown}
+breakdown_hsa <- tibble(mirna = unique_hsa) %>%
+  rowwise() %>%
+  mutate(
+    fam       = list(family_hsa %>% filter(mirna_name == mirna) %>% pull(mir_family)),
+    n_ts      = nrow(ts_hsa %>% filter(mir_family %in% fam)),
+    n_db      = nrow(mirdb_hsa %>% filter(mirna_name == mirna)),
+    n_ts_only = length(setdiff(
+      toupper(ts_hsa %>% filter(mir_family %in% fam) %>% pull(gene_symbol)),
+      toupper(mirdb_hsa %>% filter(mirna_name == mirna) %>% pull(gene_symbol))
+    )),
+    n_db_only = length(setdiff(
+      toupper(mirdb_hsa %>% filter(mirna_name == mirna) %>% pull(gene_symbol)),
+      toupper(ts_hsa %>% filter(mir_family %in% fam) %>% pull(gene_symbol))
+    )),
+    n_both    = length(intersect(
+      toupper(ts_hsa %>% filter(mir_family %in% fam) %>% pull(gene_symbol)),
+      toupper(mirdb_hsa %>% filter(mirna_name == mirna) %>% pull(gene_symbol))
+    )),
+    n_union   = length(hsa_targets[[mirna]])
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-fam) %>%
+  mutate(species = "hsa")
+
+breakdown_mmu <- tibble(mirna = unique_mmu) %>%
+  rowwise() %>%
+  mutate(
+    fam       = list(family_mmu %>% filter(mirna_name == mirna) %>% pull(mir_family)),
+    n_ts      = nrow(ts_mmu %>% filter(mir_family %in% fam)),
+    n_db      = nrow(mirdb_mmu %>% filter(mirna_name == mirna)),
+    n_ts_only = length(setdiff(
+      toupper(ts_mmu %>% filter(mir_family %in% fam) %>% pull(gene_symbol)),
+      toupper(mirdb_mmu %>% filter(mirna_name == mirna) %>% pull(gene_symbol))
+    )),
+    n_db_only = length(setdiff(
+      toupper(mirdb_mmu %>% filter(mirna_name == mirna) %>% pull(gene_symbol)),
+      toupper(ts_mmu %>% filter(mir_family %in% fam) %>% pull(gene_symbol))
+    )),
+    n_both    = length(intersect(
+      toupper(ts_mmu %>% filter(mir_family %in% fam) %>% pull(gene_symbol)),
+      toupper(mirdb_mmu %>% filter(mirna_name == mirna) %>% pull(gene_symbol))
+    )),
+    n_union   = length(mmu_targets[[mirna]])
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-fam) %>%
+  mutate(species = "mmu")
+
+breakdown <- bind_rows(breakdown_hsa, breakdown_mmu) %>%
+  dplyr::select(species, mirna, n_ts, n_db, n_ts_only, n_db_only, n_both, n_union)
+
+cat("Target source breakdown:\n")
+print(as_tibble(breakdown), n = Inf)
+
+write.csv(breakdown,
+          file.path(dir_out, "target_source_breakdown.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: target_source_breakdown.csv\n")
+```
+
+# 12. Save shared target gene lists per pair
+
+```{r save-shared-genes}
+shared_genes_all <- jaccard_res %>%
+  rowwise() %>%
+  mutate(
+    shared_genes = paste(
+      sort(intersect(.hsa[[hsa_miRNA]], .mmu[[mmu_miRNA]])),
+      collapse = ";"
+    )
+  ) %>%
+  ungroup() %>%
+  dplyr::select(mmu_miRNA, hsa_miRNA, miR_family, miRNA_cluster,
+                jaccard_index, n_intersect, shared_genes)
+
+write.csv(shared_genes_all,
+          file.path(dir_out, "shared_target_genes_per_pair.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: shared_target_genes_per_pair.csv\n")
+cat("\nShared gene counts:\n")
+print(shared_genes_all %>% dplyr::select(-shared_genes), n = Inf)
+```
+
+# 13. Session info
+
+```{r session-info}
+sessionInfo()
+```

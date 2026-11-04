@@ -1,0 +1,261 @@
+---
+title: "Plasma miRNA — maSigPro time-course analysis"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.height = 11,
+  fig.width  = 19.56,
+  dpi        = 300
+)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(maSigPro)
+```
+
+# 2. Parameters
+
+```{r params}
+wd <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd, "output", "maSigPro", date_str)
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory:", dir_output, "\n")
+
+# 除外サンプル（外れ値）
+outlier_samples <- c("1wk_201", "3d_206", "6wk_174", "8wk_234")
+
+# maSigPro パラメータ
+RSQ_CUTOFF <- 0.60
+N_CLUSTERS  <- 5
+```
+
+# 3. Load data
+
+```{r load_data}
+data.miRNA <- read.csv(
+  "F:/wd/cohort7_miRNAs/cohort7_miRNAs/output/data.clean_matrix.csv",
+  header = TRUE, check.names = FALSE
+)
+
+data.miRNA <- as.data.frame(data.miRNA) %>%
+  column_to_rownames(var = "miR")
+
+cat("miRNA matrix:", nrow(data.miRNA), "miRNAs x", ncol(data.miRNA), "samples\n")
+```
+
+# 4. Filter samples (outlier removal)
+
+```{r filter_samples}
+# Long format に変換
+data.miRNA_long <- data.miRNA %>%
+  rownames_to_column(var = "miRNA_Name") %>%
+  pivot_longer(
+    cols      = -miRNA_Name,
+    names_to  = "sample.ID",
+    values_to = "TPM"
+  ) %>%
+  mutate(timepoint = sub("^(\\w+)_.*", "\\1", sample.ID))
+
+data.miRNA_long$timepoint <- factor(
+  data.miRNA_long$timepoint,
+  levels = c("0d", "1d", "3d", "1wk", "2wk",
+             "4wk", "6wk", "8wk", "10wk", "12wk")
+)
+
+# 外れ値サンプルを除外
+data.miRNA_filtered_long <- data.miRNA_long %>%
+  filter(!sample.ID %in% outlier_samples)
+
+cat("Excluded samples:", paste(outlier_samples, collapse = ", "), "\n")
+cat("Remaining samples:",
+    length(unique(data.miRNA_filtered_long$sample.ID)), "\n")
+
+# Wide format（miRNA × sample 行列）に戻す
+data.miRNA_filtered_wide <- data.miRNA_filtered_long %>%
+  dplyr::select(sample.ID, miRNA_Name, TPM) %>%
+  pivot_wider(
+    names_from  = "sample.ID",
+    values_from = "TPM"
+  ) %>%
+  column_to_rownames(var = "miRNA_Name")
+```
+
+## Boxplot: log2(1+TPM) distribution
+
+```{r boxplot}
+ggplot(data.miRNA_filtered_long,
+       aes(x = sample.ID, y = log2(1 + TPM))) +
+  geom_boxplot(outlier.shape = TRUE, fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        plot.title  = element_text(size = 14, face = "bold")) +
+  labs(title = "Distribution of log2(1+TPM) across samples",
+       x = "Sample ID", y = "log2(1+TPM)")
+```
+
+# 5. maSigPro
+
+## 5.1. Experimental design matrix
+
+```{r edesign}
+# タイムポイントを日数（day）で設定
+# 0d=0, 1d=1, 3d=3, 1wk=7, 2wk=14, 4wk=28, 6wk=42, 8wk=56, 10wk=70, 12wk=84
+time_days <- c(0, 1, 3, 7, 14, 28, 42, 56, 70, 84)   # 10 timepoints × 5 replicates
+
+edesign <- data.frame(
+  Time      = rep(time_days, each = 5),
+  Replicate = rep(seq_along(time_days), each = 5),
+  Group     = rep(1L, 50)
+)
+
+# 除外サンプルに対応する行を削除（元の列順で 14, 20, 32, 40 番目）
+edesign <- edesign[-c(14, 20, 32, 40), ]
+
+# 行名をサンプル名に設定
+rownames(edesign) <- colnames(data.miRNA_filtered_wide)
+
+cat("edesign rows:", nrow(edesign), "\n")
+print(head(edesign))
+```
+
+## 5.2. Condition number & scaling
+
+```{r scaling}
+# スケーリング前の condition number
+edesign_raw <- make.design.matrix(edesign, degree = 3)
+cat("Condition number (before scaling):", kappa(edesign_raw$dis), "\n")
+
+# Time を 0-1 にスケーリング
+edesign$Time <- edesign$Time / max(edesign$Time)
+
+# スケーリング後の design matrix & condition number
+edesign <- make.design.matrix(edesign, degree = 3)
+cat("Condition number (after scaling) :", kappa(edesign$dis), "\n")
+```
+
+## 5.3. p.vector
+
+```{r pvector}
+fit <- p.vector(
+  data.miRNA_filtered_wide,
+  edesign,
+  Q             = 0.05,
+  MT.adjust     = "BH",
+  min.obs       = 6,        # 修正: 20 → 6
+  counts        = FALSE,    # 修正: TPM 入力のため FALSE
+  theta         = 10
+)
+
+cat("Significant miRNAs (p.vector):", fit$i, "\n")
+```
+
+## 5.4. T.fit & get.siggenes
+
+```{r tfit}
+tstep <- T.fit(fit)
+sigs  <- get.siggenes(tstep, rsq = RSQ_CUTOFF, vars = "groups")
+
+cat("Significant miRNAs (rsq >=", RSQ_CUTOFF, "):",
+    length(sigs$sig.genes$Group$sig.profiles), "\n")
+```
+
+## 5.5. Hierarchical clustering (k = 5)
+
+```{r clustering_plot}
+name_masigpro <- paste0("Plasma_miRNA_maSigPro_rsq",
+                         RSQ_CUTOFF, "_hclust.k", N_CLUSTERS)
+
+svg(filename = file.path(dir_output, paste0(name_masigpro, ".svg")))
+
+gene.clust <- see.genes(
+  sigs$sig.genes$Group,
+  show.fit       = TRUE,
+  dis            = edesign$dis,
+  cluster.method = "hclust",
+  cluster.data   = 1,
+  k              = N_CLUSTERS,
+  newX11         = FALSE
+)
+
+dev.off()
+
+sig.gene_df           <- as.data.frame(gene.clust$cut)
+colnames(sig.gene_df) <- "cluster"
+
+write.csv(sig.gene_df,
+          file.path(dir_output, paste0(name_masigpro, ".csv")))
+
+cat("Cluster sizes:\n")
+print(table(sig.gene_df$cluster))
+```
+
+# 6. Single miRNA plot (example)
+
+```{r single_miRNA_plot}
+data.miRNA_filtered_long %>%
+  filter(miRNA_Name == "mmu-miR-486a-5p") %>%
+  ggplot(aes(x = timepoint, y = log2(1 + TPM))) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.5) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 10),
+    axis.title  = element_text(size = 12)
+  ) +
+  labs(x = "Timepoint", y = "log2(1+TPM)",
+       title = "mmu-miR-486a-5p expression")
+```
+
+# 7. Cluster gene lists
+
+```{r cluster_lists}
+# maSigPro 結果 CSV を読み込み（別チャンクから再現性のため）
+sig.gene_df <- read.csv(
+  file.path(dir_output, paste0(name_masigpro, ".csv"))
+)
+colnames(sig.gene_df) <- c("miRNA_Name", "cluster")
+sig.gene_df <- column_to_rownames(sig.gene_df, var = "miRNA_Name")
+
+for (clst_number in 1:N_CLUSTERS) {
+
+  clst_miRNAs <- sig.gene_df %>%
+    filter(cluster == clst_number) %>%
+    rownames()
+
+  clst_df <- data.frame(
+    miRNA_Name = clst_miRNAs,
+    cluster    = clst_number
+  )
+
+  out_file <- file.path(dir_output,
+                        paste0("Plasma_miRNA_ids_clst_", clst_number, ".csv"))
+  write.csv(clst_df, out_file, row.names = FALSE)
+
+  cat("Cluster", clst_number, ":", length(clst_miRNAs), "miRNAs\n")
+}
+```
+
+# Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

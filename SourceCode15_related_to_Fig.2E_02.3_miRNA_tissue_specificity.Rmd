@@ -1,0 +1,942 @@
+﻿---
+title: "miRNA Tissue Specificity — Tau index, Fisher's test, GLMM"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.height = 5, fig.width = 8, dpi = 150)
+```
+
+# Overview
+
+This Rmd quantifies **tissue directionality** of miRNAs detected in the union
+negative-cosine-similarity pairs (`negative_cosine_pairs_union.csv`).
+
+Three complementary approaches are used:
+
+| Method | What it measures | Non-independence handling |
+|---|---|---|
+| **Tau index** | Tissue specificity of each miRNA (0 = ubiquitous, 1 = specific) | N/A (descriptive) |
+| **Fisher's exact test** | Enrichment of each miRNA in each tissue vs. all others | Bonferroni / BH correction |
+| **GLMM** | Tissue membership modelled with miRNA and mRNA as random effects | `(1\|miRNA_Name) + (1\|SYMBOL)` |
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(patchwork)
+library(lme4)       # GLMM: glmer()
+library(blme)       # Bayesian GLMM: bglmer() with weakly informative priors
+library(broom.mixed)# tidy() for lme4 objects
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna     <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+tissue_order <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+N_TISSUES    <- length(tissue_order)
+
+# Tau classification thresholds
+TAU_HIGH <- 0.70   # >= HIGH -> tissue-specific
+TAU_LOW  <- 0.30   # <= LOW  -> ubiquitous
+
+find_union_pairs_csv <- function() {
+  base <- file.path(wd_mirna, "output", "02_integration")
+  dated_dirs <- sort(list.dirs(base, recursive = FALSE), decreasing = TRUE)
+  for (d in dated_dirs) {
+    p <- file.path(d, "union", "negative_cosine_pairs_union.csv")
+    if (file.exists(p)) return(p)
+  }
+  stop("negative_cosine_pairs_union.csv not found")
+}
+
+union_csv <- find_union_pairs_csv()
+out_dir   <- dirname(union_csv)
+
+cat("Input :", union_csv, "\n")
+cat("Output:", out_dir,   "\n")
+```
+
+# 3. Load and prepare data
+
+```{r load}
+pairs <- read.csv(union_csv, stringsAsFactors = FALSE) %>%
+  mutate(
+    tissue        = factor(tissue, levels = tissue_order),
+    miRNA_cluster = factor(as.character(miRNA_cluster))
+  )
+
+cat("Total pairs   :", nrow(pairs),                     "\n")
+cat("Unique miRNAs :", n_distinct(pairs$miRNA_Name),    "\n")
+cat("Unique mRNAs  :", n_distinct(pairs$SYMBOL),        "\n")
+cat("Tissues       :", paste(levels(pairs$tissue), collapse = ", "), "\n")
+```
+
+# 4. miRNA × tissue count matrix
+
+Rows = miRNA, columns = tissue, values = number of mRNA pairs.
+Missing tissue–miRNA combinations are filled with 0.
+
+```{r count-matrix}
+mirna_tissue_counts <- pairs %>%
+  count(miRNA_Name, miRNA_cluster, tissue, .drop = FALSE) %>%
+  complete(miRNA_Name, tissue = factor(tissue_order, levels = tissue_order),
+           fill = list(n = 0)) %>%
+  group_by(miRNA_Name) %>%
+  fill(miRNA_cluster, .direction = "downup") %>%
+  ungroup()
+
+# Wide format for display
+count_wide <- mirna_tissue_counts %>%
+  pivot_wider(names_from = tissue, values_from = n,
+              values_fill = 0) %>%
+  mutate(total = rowSums(across(all_of(tissue_order))))
+
+cat("miRNA x tissue count matrix (head):\n")
+print(head(count_wide))
+
+write.csv(count_wide,
+          file.path(out_dir, "miRNA_tissue_count_matrix.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: miRNA_tissue_count_matrix.csv\n")
+```
+
+# 5. Tau index
+
+The **Tau index** (Yanai et al. 2005) measures tissue specificity using the
+per-miRNA distribution of pair counts across tissues:
+
+$$
+\tau_i = \frac{\sum_{j=1}^{N} \left(1 - \hat{x}_{ij}\right)}{N - 1},
+\quad \hat{x}_{ij} = \frac{x_{ij}}{\max_j x_{ij}}
+$$
+
+$\tau = 1$ → all pairs concentrated in one tissue;
+$\tau = 0$ → perfectly uniform across all tissues.
+miRNAs with total pairs = 0 (not applicable here) or max = 0 receive NA.
+
+Two variants are computed, differing in the input $x_{ij}$:
+
+| Variant | $x_{ij}$ | Rationale |
+|---------|-----------|-----------|
+| **Raw** | $c_{ij}$ — raw pair count of miRNA $i$ in tissue $j$ | Standard Tau; reflects absolute pair distribution |
+| **Normalized** | $c_{ij} / M_j$ — pair count divided by total pairs in tissue $j$ | Removes tissue-level detection bias (e.g. ewat having more detectable target pairs overall) |
+
+where $M_j = \sum_i c_{ij}$ is the total number of pairs detected in tissue $j$.
+Normalization ensures that a miRNA appearing uniformly across all tissues is not
+spuriously classified as tissue-specific merely because one tissue has higher
+overall detection depth.
+
+```{r tau}
+compute_tau <- function(x) {
+  if (all(x == 0) || max(x, na.rm = TRUE) == 0) return(NA_real_)
+  xhat <- x / max(x, na.rm = TRUE)
+  sum(1 - xhat) / (length(x) - 1)
+}
+
+mirna_cluster_lut <- pairs %>%
+  distinct(miRNA_Name, miRNA_cluster)
+
+# Per-tissue total pairs M_j (used for normalization)
+tissue_total <- pairs %>%
+  count(tissue, name = "M_j") %>%
+  mutate(tissue = as.character(tissue))
+
+cat("Total pairs per tissue (M_j):\n")
+print(arrange(tissue_total, desc(M_j)))
+
+# Helper: build tau_df from a counts data frame; x_col = column used for tau
+build_tau_df <- function(counts_long, x_col) {
+  counts_long %>%
+    group_by(miRNA_Name) %>%
+    summarise(
+      tau        = compute_tau(.data[[x_col]]),
+      n_total    = sum(n),       # always raw pair count
+      n_tissues  = sum(n > 0),   # always raw pair count
+      top_tissue = {
+        idx <- which.max(.data[[x_col]])
+        if (length(idx) == 0) NA_character_ else as.character(tissue[idx])
+      },
+      .groups = "drop"
+    ) %>%
+    left_join(mirna_cluster_lut, by = "miRNA_Name") %>%
+    mutate(
+      specificity = case_when(
+        tau >= TAU_HIGH ~ "tissue-specific",
+        tau <= TAU_LOW  ~ "ubiquitous",
+        TRUE            ~ "intermediate"
+      ) %>% factor(levels = c("tissue-specific", "intermediate", "ubiquitous"))
+    ) %>%
+    arrange(desc(tau))
+}
+
+# Raw Tau: x_ij = raw pair count
+tau_df <- build_tau_df(mirna_tissue_counts, "n")
+
+# Normalized Tau: x_ij / M_j removes tissue-level detection bias
+mirna_tissue_norm <- mirna_tissue_counts %>%
+  mutate(tissue_chr = as.character(tissue)) %>%
+  left_join(tissue_total, by = c("tissue_chr" = "tissue")) %>%
+  mutate(n_norm = n / M_j)
+
+tau_norm_df <- build_tau_df(mirna_tissue_norm, "n_norm")
+
+cat("\nRaw Tau summary:\n");       print(tau_df,      n = Inf)
+cat("\nNormalized Tau summary:\n"); print(tau_norm_df, n = Inf)
+
+cat("\nSpecificity (raw):\n");        print(table(tau_df$specificity))
+cat("\nSpecificity (normalized):\n"); print(table(tau_norm_df$specificity))
+
+write.csv(tau_df,
+          file.path(out_dir, "miRNA_tau_index.csv"),
+          row.names = FALSE, quote = TRUE)
+write.csv(tau_norm_df,
+          file.path(out_dir, "miRNA_tau_index_normalized.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: miRNA_tau_index.csv / miRNA_tau_index_normalized.csv\n")
+```
+
+## 5a. Tau index bar chart
+
+```{r tau-bar, fig.height=5, fig.width=18}
+CLUST_COLORS <- c("1" = "#B3E2CD", "2" = "#FDCDAC", "3" = "#CBD5E8",
+                  "4" = "#F4CAE4", "5" = "#FFF2AE")
+SPEC_SHAPES  <- c("tissue-specific" = 8, "intermediate" = 21, "ubiquitous" = 16)
+
+make_tau_bar_plot <- function(df, subtitle_extra) {
+  plot_data <- df %>%
+    mutate(
+      miRNA_short = sub("^mmu-", "", miRNA_Name),
+      miRNA_short = factor(miRNA_short, levels = rev(unique(miRNA_short)))
+    )
+  ggplot(plot_data, aes(x = miRNA_short, y = tau, fill = miRNA_cluster)) +
+    geom_col(width = 0.7, color = "white", linewidth = 0.3) +
+    geom_hline(yintercept = TAU_LOW,  linetype = "dashed",
+               color = "#2166ac", linewidth = 0.6) +
+    geom_hline(yintercept = TAU_HIGH, linetype = "dashed",
+               color = "#d6604d", linewidth = 0.6) +
+    geom_text(aes(label = top_tissue), hjust = -0.15, size = 2.8, color = "grey30") +
+    scale_fill_manual(name = "Cluster", values = CLUST_COLORS) +
+    scale_y_continuous(limits = c(0, 1.15), expand = expansion(mult = c(0, 0))) +
+    annotate("text", x = nrow(plot_data) + 0.3, y = TAU_HIGH + 0.02,
+             label = paste0("tissue-specific\n(τ ≥" , TAU_HIGH, ")"),
+             hjust = 0, size = 3, color = "#d6604d") +
+    annotate("text", x = nrow(plot_data) + 0.3, y = TAU_LOW - 0.02,
+             label = paste0("ubiquitous\n(τ ≤", TAU_LOW, ")"),
+             hjust = 0, vjust = 1, size = 3, color = "#2166ac") +
+    coord_flip() +
+    labs(
+      title    = paste0("Tau index — ", subtitle_extra),
+      subtitle = paste0("n tissues = ", N_TISSUES, "  |  label = tissue with most pairs"),
+      x = NULL, y = "τ (Tau index)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title         = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle      = element_text(color = "grey40", hjust = 0.5, size = 9),
+      panel.grid.major.y = element_blank()
+    )
+}
+
+p_tau_raw  <- make_tau_bar_plot(tau_df,      "raw counts")
+p_tau_norm <- make_tau_bar_plot(tau_norm_df, "normalized by tissue total pairs")
+p_tau_both <- p_tau_raw | p_tau_norm
+
+print(p_tau_both)
+
+ggsave(file.path(out_dir, "tau_index_barplot.svg"),
+       p_tau_raw,  width = 9, height = 5)
+ggsave(file.path(out_dir, "tau_index_barplot.png"),
+       p_tau_raw,  width = 9, height = 5, dpi = 300)
+ggsave(file.path(out_dir, "tau_index_barplot_norm.svg"),
+       p_tau_norm, width = 9, height = 5)
+ggsave(file.path(out_dir, "tau_index_barplot_norm.png"),
+       p_tau_norm, width = 9, height = 5, dpi = 300)
+ggsave(file.path(out_dir, "tau_index_barplot_both.svg"),
+       p_tau_both, width = 18, height = 5)
+ggsave(file.path(out_dir, "tau_index_barplot_both.png"),
+       p_tau_both, width = 18, height = 5, dpi = 300)
+cat("Saved: tau_index_barplot*.svg / .png\n")
+```
+
+## 5c. Tau index bar chart by top tissue
+
+```{r tau-by-tissue, fig.width=18, fig.height=max(6, nrow(tau_df) * 0.28 + 2)}
+make_tau_tis_plot <- function(df, subtitle_extra) {
+  plot_data <- df %>%
+    filter(!is.na(top_tissue)) %>%
+    mutate(
+      miRNA_short = sub("^mmu-", "", miRNA_Name),
+      top_tissue  = factor(top_tissue, levels = tissue_order)
+    ) %>%
+    arrange(top_tissue, tau) %>%
+    mutate(miRNA_short = factor(miRNA_short, levels = unique(miRNA_short)))
+
+  ggplot(plot_data, aes(x = miRNA_short, y = tau, fill = miRNA_cluster)) +
+    geom_col(width = 0.7, color = "white", linewidth = 0.3) +
+    geom_hline(yintercept = TAU_LOW,  linetype = "dashed",
+               color = "#2166ac", linewidth = 0.6) +
+    geom_hline(yintercept = TAU_HIGH, linetype = "dashed",
+               color = "#d6604d", linewidth = 0.6) +
+    scale_fill_manual(name = "Cluster", values = CLUST_COLORS) +
+    scale_y_continuous(limits = c(0, 1.05),
+                       expand = expansion(mult = c(0, 0.02))) +
+    coord_flip() +
+    facet_grid(top_tissue ~ ., scales = "free_y", space = "free_y") +
+    labs(
+      title    = paste0("Tau index by top tissue — ", subtitle_extra),
+      subtitle = paste0("Faceted by tissue with most pairs | ",
+                        "τ ≥ ", TAU_HIGH, " = tissue-specific  |  ",
+                        "τ ≤ ", TAU_LOW,  " = ubiquitous"),
+      x = NULL, y = "τ (Tau index)"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title         = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle      = element_text(color = "grey40", hjust = 0.5, size = 9),
+      panel.grid.major.y = element_blank(),
+      strip.text         = element_text(face = "bold", size = 10),
+      strip.background   = element_rect(fill = "grey92", color = "grey60")
+    )
+}
+
+p_tau_tis_raw  <- make_tau_tis_plot(tau_df,      "raw counts")
+p_tau_tis_norm <- make_tau_tis_plot(tau_norm_df, "normalized by tissue total pairs")
+p_tau_tis_both <- p_tau_tis_raw | p_tau_tis_norm
+
+print(p_tau_tis_both)
+
+fig_h_tis <- max(6, nrow(tau_df) * 0.28 + 2)
+ggsave(file.path(out_dir, "tau_index_by_tissue.svg"),
+       p_tau_tis_raw,  width = 9, height = fig_h_tis)
+ggsave(file.path(out_dir, "tau_index_by_tissue.png"),
+       p_tau_tis_raw,  width = 9, height = fig_h_tis, dpi = 300)
+ggsave(file.path(out_dir, "tau_index_by_tissue_norm.svg"),
+       p_tau_tis_norm, width = 9, height = fig_h_tis)
+ggsave(file.path(out_dir, "tau_index_by_tissue_norm.png"),
+       p_tau_tis_norm, width = 9, height = fig_h_tis, dpi = 300)
+ggsave(file.path(out_dir, "tau_index_by_tissue_both.svg"),
+       p_tau_tis_both, width = 18, height = fig_h_tis)
+ggsave(file.path(out_dir, "tau_index_by_tissue_both.png"),
+       p_tau_tis_both, width = 18, height = fig_h_tis, dpi = 300)
+cat("Saved: tau_index_by_tissue*.svg / .png\n")
+```
+
+## 5b. Tau vs n_tissues scatter
+
+```{r tau-scatter, fig.height=4, fig.width=6}
+p_scatter <- ggplot(tau_df,
+                    aes(x = n_tissues, y = tau,
+                        color = miRNA_cluster, label = sub("^mmu-", "", miRNA_Name))) +
+  geom_point(size = 3, alpha = 0.85) +
+  ggrepel::geom_text_repel(size = 2.8, max.overlaps = 20,
+                            segment.color = "grey70") +
+  scale_color_manual(name = "Cluster", values = CLUST_COLORS) +
+  scale_x_continuous(breaks = 1:N_TISSUES) +
+  geom_hline(yintercept = c(TAU_LOW, TAU_HIGH), linetype = "dashed",
+             color = c("#2166ac", "#d6604d"), linewidth = 0.5) +
+  labs(
+    title = "Tau index vs. number of active tissues",
+    x = "n tissues (pairs > 0)", y = "\u03c4 (Tau index)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# ggrepel may not be installed; fall back to plain text
+tryCatch(print(p_scatter),
+  error = function(e) {
+    p_scatter2 <- p_scatter +
+      geom_text(size = 2.8, vjust = -0.5, check_overlap = TRUE)
+    p_scatter2$layers <- p_scatter2$layers[
+      !sapply(p_scatter2$layers,
+              function(l) inherits(l$geom, "GeomTextRepel"))]
+    print(p_scatter2)
+  })
+
+ggsave(file.path(out_dir, "tau_vs_ntissues_scatter.svg"), p_scatter, width = 6, height = 4)
+ggsave(file.path(out_dir, "tau_vs_ntissues_scatter.png"), p_scatter, width = 6, height = 4,
+       dpi = 300)
+cat("Saved: tau_vs_ntissues_scatter.svg / .png\n")
+```
+
+# 6. Fisher's exact test (miRNA × tissue enrichment)
+
+For each miRNA $i$ and tissue $j$, a 2×2 contingency table is constructed:
+
+|  | tissue $j$ | other tissues |
+|---|---|---|
+| miRNA $i$ | $a$ | $b$ |
+| other miRNAs | $c$ | $d$ |
+
+where counts are the number of mRNA pairs.
+One-sided Fisher's exact test (greater), BH correction across all
+`r n_distinct(pairs$miRNA_Name)` × `r N_TISSUES` cells.
+
+```{r fisher}
+mirna_list  <- unique(pairs$miRNA_Name)
+tissue_list <- tissue_order
+
+fisher_results <- expand_grid(miRNA_Name = mirna_list,
+                              tissue     = tissue_list) %>%
+  rowwise() %>%
+  mutate(
+    a = sum(pairs$miRNA_Name == miRNA_Name & pairs$tissue == tissue),
+    b = sum(pairs$miRNA_Name == miRNA_Name & pairs$tissue != tissue),
+    c = sum(pairs$miRNA_Name != miRNA_Name & pairs$tissue == tissue),
+    d = sum(pairs$miRNA_Name != miRNA_Name & pairs$tissue != tissue),
+    p_value   = tryCatch(
+      fisher.test(matrix(c(a, b, c, d), nrow = 2),
+                  alternative = "greater")$p.value,
+      error = function(e) NA_real_
+    ),
+    odds_ratio = tryCatch(
+      fisher.test(matrix(c(a, b, c, d), nrow = 2),
+                  alternative = "greater")$estimate,
+      error = function(e) NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    sig   = case_when(
+      p_adj   < 0.05 ~ "FDR < 0.05",
+      p_value < 0.05 ~ "p < 0.05",
+      TRUE           ~ "n.s."
+    )
+  ) %>%
+  left_join(tau_df %>% dplyr::select(miRNA_Name, miRNA_cluster),
+            by = "miRNA_Name") %>%
+  arrange(p_adj, p_value)
+
+cat("Fisher results (significant FDR < 0.05):\n")
+fisher_results %>%
+  filter(sig == "FDR < 0.05") %>%
+  dplyr::select(miRNA_Name, tissue, a, b, c, d,
+                odds_ratio, p_value, p_adj) %>%
+  as_tibble() %>%
+  print(n = Inf)
+
+write.csv(fisher_results,
+          file.path(out_dir, "miRNA_tissue_fisher.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: miRNA_tissue_fisher.csv\n")
+```
+
+## 6a. Heatmap: -log10(p_adj) per miRNA × tissue
+
+```{r s4f_mirna_order}
+# Replicate S4f miRNA order: cluster (ascending) then n_pairs descending within cluster
+s4f_mirna_order <- pairs %>%
+  group_by(miRNA_Name, miRNA_cluster) %>%
+  summarise(n_pairs = n(), .groups = "drop") %>%
+  mutate(
+    miRNA_short   = sub("^mmu-", "", miRNA_Name),
+    miRNA_cluster = factor(as.character(miRNA_cluster),
+                           levels = as.character(sort(unique(as.integer(
+                             as.character(miRNA_cluster))))))
+  ) %>%
+  arrange(miRNA_cluster, desc(n_pairs)) %>%
+  pull(miRNA_short)
+
+# Cluster positions along s4f_mirna_order for boundary lines and labels
+mirna_cluster_short <- pairs %>%
+  distinct(miRNA_Name, miRNA_cluster) %>%
+  mutate(miRNA_short = sub("^mmu-", "", miRNA_Name))
+
+s4f_cluster_seq <- tibble(miRNA_short = s4f_mirna_order) %>%
+  left_join(mirna_cluster_short, by = "miRNA_short") %>%
+  mutate(pos = row_number(),
+         miRNA_cluster = as.character(miRNA_cluster))
+
+# Horizontal boundary positions (between clusters)
+boundary_pos <- s4f_cluster_seq %>%
+  group_by(miRNA_cluster) %>%
+  summarise(last_pos = max(pos), .groups = "drop") %>%
+  arrange(miRNA_cluster) %>%
+  slice(-n()) %>%
+  pull(last_pos) + 0.5
+
+# Cluster label midpoints
+cluster_mid <- s4f_cluster_seq %>%
+  group_by(miRNA_cluster) %>%
+  summarise(mid_pos = mean(pos), .groups = "drop") %>%
+  arrange(miRNA_cluster)
+
+# Reversed order (Cluster5 at bottom → Cluster1 at top): boundary and midpoints
+cluster_sizes_rev <- s4f_cluster_seq %>%
+  group_by(miRNA_cluster) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  arrange(desc(miRNA_cluster)) %>%
+  mutate(
+    end_pos   = cumsum(n),
+    start_pos = end_pos - n + 1,
+    mid_pos   = (start_pos + end_pos) / 2
+  )
+
+boundary_pos_rev <- cluster_sizes_rev$end_pos[-nrow(cluster_sizes_rev)] + 0.5
+cluster_mid_rev  <- cluster_sizes_rev %>% dplyr::select(miRNA_cluster, mid_pos)
+```
+
+```{r fisher-heatmap, fig.width=8, fig.height=14}
+fisher_heat <- fisher_results %>%
+  mutate(
+    neg_log10_padj = pmin(-log10(p_adj + 1e-10), 5),  # cap at 5
+    miRNA_short    = sub("^mmu-", "", miRNA_Name),
+    tissue         = factor(tissue, levels = tissue_order),
+    # * = FDR < 0.05; # = nominal p < 0.05
+    label_sig      = case_when(
+      sig == "FDR < 0.05" ~ "*",
+      sig == "p < 0.05"   ~ "#",
+      TRUE                ~ ""
+    )
+  ) %>%
+  # rev() puts Cluster5 at bottom, Cluster1 at top
+  mutate(miRNA_short = factor(miRNA_short, levels = rev(s4f_mirna_order)))
+
+# Dynamic ggsave dimensions: square cells
+n_mirna_heat  <- length(s4f_mirna_order)
+fig_w_heat    <- 8
+cell_in       <- (fig_w_heat - 2.5) / length(tissue_order)
+fig_h_heat    <- max(5, cell_in * n_mirna_heat + 2)
+
+p_fish_heat <- ggplot(fisher_heat,
+                      aes(x = tissue, y = miRNA_short,
+                          fill = neg_log10_padj)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(data = fisher_heat %>% filter(sig != "n.s."),
+            aes(label = label_sig),
+            size = 3, color = "grey30", fontface = "bold") +
+  geom_hline(yintercept = boundary_pos_rev,
+             color = "grey30", linewidth = 0.6, linetype = "solid") +
+  scale_fill_gradient(low = "white", high = "#d6604d",
+                      name = "-log10(FDR)\n\n* FDR < 0.05\n# p < 0.05",
+                      limits = c(0, 5)) +
+  annotate("text",
+           x     = length(tissue_order) + 0.6,
+           y     = cluster_mid_rev$mid_pos,
+           label = paste0("C", cluster_mid_rev$miRNA_cluster),
+           size = 3, hjust = 0, color = "grey20", fontface = "bold") +
+  coord_fixed(clip = "off") +
+  labs(
+    title    = "Fisher's exact test: miRNA enrichment per tissue",
+    subtitle = "One-sided (greater); BH correction",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(color = "grey40", hjust = 0.5, size = 9),
+    plot.margin     = margin(5, 30, 5, 5),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    axis.text.y     = element_text(size = 9),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+print(p_fish_heat)
+ggsave(file.path(out_dir, "fisher_heatmap_padj.svg"),
+       p_fish_heat, width = fig_w_heat, height = fig_h_heat, limitsize = FALSE)
+ggsave(file.path(out_dir, "fisher_heatmap_padj.png"),
+       p_fish_heat, width = fig_w_heat, height = fig_h_heat, dpi = 300, limitsize = FALSE)
+cat(sprintf("Saved: fisher_heatmap_padj.svg / .png  (%.1f x %.1f in)\n",
+            fig_w_heat, fig_h_heat))
+```
+
+## 6b. Odds ratio heatmap
+
+```{r or-heatmap, fig.width=8, fig.height=14}
+or_heat <- fisher_results %>%
+  mutate(
+    log2OR      = log2(pmax(odds_ratio, 0.01)),   # floor at 0.01 to avoid -Inf
+    miRNA_short = sub("^mmu-", "", miRNA_Name),
+    tissue      = factor(tissue, levels = tissue_order),
+    # * = FDR < 0.05; # = nominal p < 0.05
+    label_sig   = case_when(
+      sig == "FDR < 0.05" ~ "*",
+      sig == "p < 0.05"   ~ "#",
+      TRUE                ~ ""
+    )
+  ) %>%
+  mutate(miRNA_short = factor(miRNA_short, levels = rev(s4f_mirna_order)))
+
+# Symmetric scale: cap at the 95th percentile of |log2OR|
+or_limit <- quantile(abs(or_heat$log2OR[is.finite(or_heat$log2OR)]), 0.95, na.rm = TRUE)
+cat(sprintf("log2OR colour limit (95th pctile of |log2OR|): %.2f\n", or_limit))
+
+p_or <- ggplot(or_heat, aes(x = tissue, y = miRNA_short, fill = log2OR)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(data = or_heat %>% filter(sig != "n.s."),
+            aes(label = label_sig), size = 3,
+            color = "grey20", fontface = "bold") +
+  geom_hline(yintercept = boundary_pos_rev,
+             color = "grey30", linewidth = 0.6, linetype = "solid") +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#d6604d",
+                       midpoint = 0, name = "log2(OR)\n\n* FDR < 0.05\n# p < 0.05",
+                       limits = c(-or_limit, or_limit),
+                       oob = scales::squish) +
+  annotate("text",
+           x     = length(tissue_order) + 0.6,
+           y     = cluster_mid_rev$mid_pos,
+           label = paste0("C", cluster_mid_rev$miRNA_cluster),
+           size = 3, hjust = 0, color = "grey20", fontface = "bold") +
+  coord_fixed(clip = "off") +
+  labs(
+    title    = "Odds ratio: miRNA enrichment per tissue",
+    subtitle = "log2(OR); sorted by cluster then n_pairs",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(color = "grey40", hjust = 0.5, size = 9),
+    plot.margin     = margin(5, 30, 5, 5),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    axis.text.y     = element_text(size = 9),
+    panel.grid      = element_blank()
+  )
+
+print(p_or)
+ggsave(file.path(out_dir, "fisher_heatmap_OR.svg"),
+       p_or, width = fig_w_heat, height = fig_h_heat, limitsize = FALSE)
+ggsave(file.path(out_dir, "fisher_heatmap_OR.png"),
+       p_or, width = fig_w_heat, height = fig_h_heat, dpi = 300, limitsize = FALSE)
+cat(sprintf("Saved: fisher_heatmap_OR.svg / .png  (%.1f x %.1f in)\n",
+            fig_w_heat, fig_h_heat))
+```
+
+# 7. Logistic regression (GLMM)
+
+## Rationale
+
+The union pairs dataset contains **non-independent observations**:
+
+- The same miRNA is paired with multiple mRNAs → pairs sharing a miRNA are
+  correlated (miRNA-level clustering).
+- The same mRNA target can appear in multiple tissues → pairs sharing a gene
+  are correlated (gene-level clustering).
+
+A Generalized Linear Mixed Model (GLMM) with **random intercepts** for
+`miRNA_Name` and `SYMBOL` accounts for both sources of non-independence.
+
+For each tissue $j$ (one model per tissue):
+
+$$
+\text{logit}\,P(\text{pair} \in \text{tissue}_j) =
+  \alpha + u_{\text{miRNA}} + u_{\text{gene}}, \quad
+  u_{\text{miRNA}} \sim \mathcal{N}(0,\sigma^2_{\text{miRNA}}), \quad
+  u_{\text{gene}} \sim \mathcal{N}(0,\sigma^2_{\text{gene}})
+$$
+
+The **intraclass correlation coefficient (ICC)** for the miRNA random effect:
+
+$$
+\text{ICC}_{\text{miRNA}} =
+  \frac{\sigma^2_{\text{miRNA}}}
+       {\sigma^2_{\text{miRNA}} + \sigma^2_{\text{gene}} + \pi^2/3}
+$$
+
+A large ICC$_\text{miRNA}$ means that miRNA identity explains a substantial
+fraction of the variance in tissue membership — i.e., **miRNAs are tissue-directed**.
+
+## 7a. Null model (random effects only) — variance decomposition
+
+```{r glmm-null}
+glmm_null_results <- map_dfr(tissue_order, function(tis) {
+
+  df <- pairs %>%
+    mutate(y = as.integer(tissue == tis)) %>%
+    dplyr::select(miRNA_Name, SYMBOL, miRNA_cluster, y)
+
+  n_pos <- sum(df$y)
+  n_neg <- nrow(df) - n_pos
+
+  if (n_pos < 3 || n_neg < 3) {
+    message("Skipping ", tis, ": too few positive cases (", n_pos, ")")
+    return(tibble(tissue = tis, converged = FALSE,
+                  sigma2_miRNA = NA, sigma2_gene = NA,
+                  icc_miRNA = NA, icc_gene = NA, n_pairs = n_pos))
+  }
+
+  fit <- tryCatch(
+    glmer(y ~ 1 + (1 | miRNA_Name) + (1 | SYMBOL),
+          data = df, family = binomial,
+          control = glmerControl(optimizer = "bobyqa",
+                                 optCtrl = list(maxfun = 2e5))),
+    error   = function(e) { message(tis, ": ", e$message); NULL },
+    warning = function(w) {
+      suppressWarnings(
+        glmer(y ~ 1 + (1 | miRNA_Name) + (1 | SYMBOL),
+              data = df, family = binomial,
+              control = glmerControl(optimizer = "bobyqa",
+                                     optCtrl = list(maxfun = 2e5))))
+    }
+  )
+
+  if (is.null(fit)) {
+    return(tibble(tissue = tis, converged = FALSE,
+                  sigma2_miRNA = NA, sigma2_gene = NA,
+                  icc_miRNA = NA, icc_gene = NA, n_pairs = n_pos))
+  }
+
+  vc <- as.data.frame(VarCorr(fit))
+  s2_mirna <- vc$vcov[vc$grp == "miRNA_Name"]
+  s2_gene  <- vc$vcov[vc$grp == "SYMBOL"]
+  denom    <- s2_mirna + s2_gene + (pi^2 / 3)
+
+  tibble(
+    tissue       = tis,
+    converged    = TRUE,
+    n_pairs      = n_pos,
+    sigma2_miRNA = round(s2_mirna, 4),
+    sigma2_gene  = round(s2_gene,  4),
+    icc_miRNA    = round(s2_mirna / denom, 4),
+    icc_gene     = round(s2_gene  / denom, 4)
+  )
+})
+
+cat("GLMM null model — variance components:\n")
+print(glmm_null_results)
+
+write.csv(glmm_null_results,
+          file.path(out_dir, "glmm_null_variance_components.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: glmm_null_variance_components.csv\n")
+```
+
+## 7b. ICC visualisation
+
+```{r icc-plot, fig.height=4, fig.width=7}
+icc_long <- glmm_null_results %>%
+  filter(converged) %>%
+  pivot_longer(c(icc_miRNA, icc_gene),
+               names_to  = "source",
+               values_to = "icc") %>%
+  mutate(
+    source = recode(source,
+                    icc_miRNA = "miRNA random effect",
+                    icc_gene  = "mRNA random effect"),
+    tissue = factor(tissue, levels = tissue_order)
+  )
+
+p_icc <- ggplot(icc_long,
+                aes(x = tissue, y = icc, fill = source)) +
+  geom_col(position = position_dodge(width = 0.75),
+           width = 0.65, color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = c("miRNA random effect" = "#3182bd",
+                               "mRNA random effect"  = "#e6550d")) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title    = "GLMM — Intraclass Correlation Coefficient per tissue",
+    subtitle = "ICC\u209c\u1d35\u1d3f\u1d3a\u1d2c: fraction of variance in tissue membership explained by miRNA identity",
+    x = NULL, y = "ICC", fill = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(color = "grey40", hjust = 0.5, size = 9),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position    = "top"
+  )
+
+print(p_icc)
+ggsave(file.path(out_dir, "glmm_icc_per_tissue.svg"), p_icc, width = 7, height = 4)
+ggsave(file.path(out_dir, "glmm_icc_per_tissue.png"), p_icc, width = 7, height = 4,
+       dpi = 300)
+cat("Saved: glmm_icc_per_tissue.svg / .png\n")
+```
+
+## 7c. Full model: miRNA cluster as fixed effect
+
+Tests whether cluster membership (1–5) predicts tissue-specific pairing,
+controlling for miRNA and gene non-independence.
+
+$$
+\text{logit}\,P(\text{pair} \in \text{tissue}_j) =
+  \alpha + \beta_{\text{cluster}} +
+  u_{\text{miRNA}} + u_{\text{gene}}
+$$
+
+```{r glmm-cluster}
+# Reference = cluster with the broadest tissue distribution (lowest mean normalized Tau).
+# No miRNA in this dataset falls below TAU_LOW (0.30), so the ubiquitous category
+# is empty; the cluster closest to uniform distribution is used instead.
+ubiq_ref <- tau_norm_df %>%
+  group_by(miRNA_cluster) %>%
+  summarise(mean_tau = mean(tau, na.rm = TRUE), .groups = "drop") %>%
+  slice_min(mean_tau, n = 1, with_ties = FALSE) %>%
+  pull(miRNA_cluster) %>%
+  as.character()
+
+cat("Mean normalized Tau per cluster (reference selection):\n")
+tau_norm_df %>%
+  group_by(miRNA_cluster) %>%
+  summarise(
+    n        = n(),
+    mean_tau = mean(tau, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  arrange(mean_tau) %>%
+  print()
+cat("Selected reference cluster:", ubiq_ref, "(lowest mean normalized Tau)\n")
+
+pairs_glmm <- pairs %>%
+  mutate(miRNA_cluster = relevel(factor(as.character(miRNA_cluster)), ref = ubiq_ref))
+
+glmm_cluster_results <- map_dfr(tissue_order, function(tis) {
+
+  df <- pairs_glmm %>%
+    mutate(y = as.integer(tissue == tis)) %>%
+    dplyr::select(miRNA_Name, SYMBOL, miRNA_cluster, y)
+
+  n_pos <- sum(df$y)
+  if (n_pos < 3) return(NULL)
+
+  # bglmer() adds a weakly informative N(0, 2.5^2) prior on fixed effects,
+  # preventing divergence to ±Inf under complete separation.
+  fit <- tryCatch(
+    bglmer(y ~ miRNA_cluster + (1 | miRNA_Name) + (1 | SYMBOL),
+           data = df, family = binomial,
+           fixef.prior = normal(sd = 2.5),
+           control = glmerControl(optimizer = "bobyqa",
+                                  optCtrl = list(maxfun = 2e5))),
+    error   = function(e) { message(tis, ": ", e$message); NULL },
+    warning = function(w) suppressWarnings(
+      bglmer(y ~ miRNA_cluster + (1 | miRNA_Name) + (1 | SYMBOL),
+             data = df, family = binomial,
+             fixef.prior = normal(sd = 2.5),
+             control = glmerControl(optimizer = "bobyqa",
+                                    optCtrl = list(maxfun = 2e5))))
+  )
+
+  if (is.null(fit)) return(NULL)
+
+  tidy(fit, effects = "fixed", conf.int = TRUE) %>%
+    mutate(tissue = tis)
+})
+
+if (!is.null(glmm_cluster_results) && nrow(glmm_cluster_results) > 0) {
+
+  glmm_cluster_results <- glmm_cluster_results %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      p_adj    = p.adjust(p.value, method = "BH"),
+      sig      = case_when(
+        p_adj   < 0.05 ~ "FDR < 0.05",
+        p.value < 0.05 ~ "p < 0.05",
+        TRUE           ~ "n.s."
+      ),
+      cluster  = sub("miRNA_cluster", "Cluster ", term),
+      tissue   = factor(tissue, levels = tissue_order)
+    )
+
+  cat("GLMM cluster fixed effects (significant FDR < 0.05):\n")
+  glmm_cluster_results %>%
+    filter(sig != "n.s.") %>%
+    dplyr::select(tissue, cluster, estimate, std.error,
+                  p.value, p_adj, sig) %>%
+    as_tibble() %>%
+    print(n = Inf)
+
+  write.csv(glmm_cluster_results,
+            file.path(out_dir, "glmm_cluster_fixed_effects.csv"),
+            row.names = FALSE, quote = TRUE)
+  cat("Saved: glmm_cluster_fixed_effects.csv\n")
+
+  # Dot plot: cluster fixed effects per tissue
+  p_clust <- ggplot(glmm_cluster_results,
+                    aes(x = tissue, y = estimate,
+                        color = sig, shape = sig)) +
+    geom_hline(yintercept = 0, color = "grey50", linewidth = 0.4) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                  width = 0.2, linewidth = 0.5) +
+    geom_point(size = 3) +
+    scale_color_manual(values = c("FDR < 0.05" = "#d6604d",
+                                  "p < 0.05"   = "#f4a582",
+                                  "n.s."        = "grey60")) +
+    scale_shape_manual(values = c("FDR < 0.05" = 8,
+                                  "p < 0.05"   = 21,
+                                  "n.s."        = 16)) +
+    facet_wrap(~ cluster, nrow = 1) +
+    labs(
+      title    = "GLMM — Cluster fixed effects on tissue membership",
+      subtitle = paste0("Estimate = log-odds coefficient; error bars = 95% CI; reference = Cluster ", ubiq_ref, " (lowest mean normalized Tau; broadest tissue distribution)"),
+      x = NULL, y = paste0("log-odds (vs Cluster ", ubiq_ref, ")"),
+      color = "Significance", shape = "Significance"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title         = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle      = element_text(color = "grey40", hjust = 0.5, size = 9),
+      axis.text.x        = element_text(angle = 45, hjust = 1, size = 9),
+      strip.background   = element_rect(fill = "grey90", color = NA),
+      strip.text         = element_text(face = "bold"),
+      panel.grid.major.x = element_blank()
+    )
+
+  print(p_clust)
+  ggsave(file.path(out_dir, "glmm_cluster_effects_dotplot.svg"),
+         p_clust, width = 10, height = 5)
+  ggsave(file.path(out_dir, "glmm_cluster_effects_dotplot.png"),
+         p_clust, width = 10, height = 5, dpi = 300)
+  cat("Saved: glmm_cluster_effects_dotplot.svg / .png\n")
+
+} else {
+  cat("No GLMM cluster results (convergence failure or insufficient data)\n")
+}
+```
+
+# 8. Integrated summary table
+
+Combine Tau index, Fisher enrichment, and GLMM ICC per miRNA.
+
+```{r summary-table}
+# Best tissue per miRNA from Fisher (lowest p_adj)
+best_tissue_fisher <- fisher_results %>%
+  group_by(miRNA_Name) %>%
+  slice_min(order_by = p_adj, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(miRNA_Name,
+                fisher_top_tissue  = tissue,
+                fisher_OR          = odds_ratio,
+                fisher_p           = p_value,
+                fisher_p_adj       = p_adj,
+                fisher_sig         = sig)
+
+# GLMM: tissue with highest ICC_miRNA
+glmm_top <- glmm_null_results %>%
+  filter(converged) %>%
+  slice_max(order_by = icc_miRNA, n = 1, with_ties = FALSE) %>%
+  dplyr::select(glmm_top_tissue = tissue,
+                glmm_icc_miRNA  = icc_miRNA)
+
+summary_table <- tau_df %>%
+  dplyr::select(miRNA_Name, miRNA_cluster, tau, n_total,
+                n_tissues, specificity, top_tissue) %>%
+  left_join(best_tissue_fisher, by = "miRNA_Name") %>%
+  left_join(glmm_top %>% mutate(dummy = 1),
+            by = character())    # broadcast GLMM top tissue to all miRNAs
+
+cat("Integrated summary:\n")
+summary_table %>%
+  dplyr::select(miRNA_Name, miRNA_cluster, tau, specificity,
+                top_tissue, fisher_top_tissue, fisher_sig,
+                glmm_top_tissue, glmm_icc_miRNA) %>%
+  as_tibble() %>%
+  print(n = Inf)
+
+write.csv(summary_table,
+          file.path(out_dir, "miRNA_tissue_specificity_summary.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: miRNA_tissue_specificity_summary.csv\n")
+```

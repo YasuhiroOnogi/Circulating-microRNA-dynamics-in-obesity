@@ -1,0 +1,886 @@
+---
+title: "Plasma miRNA — GO & KEGG enrichment per tissue × miRNA cluster"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.height = 8,
+  fig.width  = 10,
+  dpi        = 150
+)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(ggplot2)
+library(msigdbr)
+library(ReactomePA)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+wd_mrna  <- "F:/wd/Mm_Bulk_RNA-seq"
+
+tissues <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+# miRNA cluster colors (consistent with 03_ circus plot)
+cluster_colors <- c(
+  "1" = "#B3E2CD",
+  "2" = "#FDCDAC",
+  "3" = "#CBD5E8",
+  "4" = "#F4CAE4",
+  "5" = "#FFF2AE"
+)
+
+# Enrichment thresholds
+PVAL_CUTOFF <- 0.05
+QVAL_CUTOFF <- 0.20
+MIN_GSET    <- 5
+MAX_GSET    <- 500
+MIN_GENES   <- 3   # minimum genes in a cluster to attempt enrichment
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd_mirna, "output", "04_GO_KEGG", date_str)
+dir_go       <- file.path(dir_output, "GO")
+dir_kegg     <- file.path(dir_output, "KEGG")
+dir_msigdb   <- file.path(dir_output, "MSigDB")
+dir_reactome <- file.path(dir_output, "Reactome")
+for (d in c(dir_go, dir_kegg, dir_msigdb, dir_reactome))
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+cat("GO       output:", dir_go,       "\n")
+cat("KEGG     output:", dir_kegg,     "\n")
+cat("MSigDB   output:", dir_msigdb,   "\n")
+cat("Reactome output:", dir_reactome, "\n")
+
+# MSigDB collections to test (category + subcategory pairs)
+MSIGDB_SETS <- list(
+  list(category = "H",  subcategory = NULL,         label = "Hallmark"),
+  list(category = "C2", subcategory = "CP:KEGG",    label = "C2_KEGG"),
+  list(category = "C2", subcategory = "CP:REACTOME", label = "C2_Reactome"),
+  list(category = "C2", subcategory = "CP:WIKIPATHWAYS", label = "C2_WikiPathways")
+)
+```
+
+# 3. Helper functions
+
+```{r helpers}
+find_masigpro_dir <- function(tissue) {
+  base      <- file.path(wd_mrna, "output", tissue)
+  all_dated <- sort(
+    list.dirs(base, full.names = TRUE, recursive = FALSE)[
+      grepl("^\\d{4}-\\d{2}-\\d{2}$",
+            basename(list.dirs(base, full.names = TRUE, recursive = FALSE)))],
+    decreasing = TRUE
+  )
+  for (d in all_dated) {
+    cand <- file.path(d, "maSigPro_rsq0.7_d3")
+    if (dir.exists(cand)) return(cand)
+  }
+  stop(paste("maSigPro_rsq0.7_d3 not found:", tissue))
+}
+
+find_union_pairs_csv <- function() {
+  base      <- file.path(wd_mirna, "output", "02_integration")
+  all_dated <- sort(list.dirs(base, full.names = TRUE, recursive = FALSE),
+                    decreasing = TRUE)
+  for (d in all_dated) {
+    f <- file.path(d, "union", "negative_cosine_pairs_union.csv")
+    if (file.exists(f)) return(f)
+  }
+  stop("negative_cosine_pairs_union.csv not found")
+}
+
+# Return path to {tissue}_nonzero_Log2TPM.csv:
+# 1. output/{tissue}/{tissue}_nonzero_Log2TPM.csv (direct)
+# 2. output/{tissue}/{date}/{tissue}_nonzero_Log2TPM.csv (latest dated dir)
+find_nonzero_csv <- function(tissue) {
+  fname  <- paste0(tissue, "_nonzero_Log2TPM.csv")
+  direct <- file.path(wd_mrna, "output", tissue, fname)
+  if (file.exists(direct)) return(direct)
+
+  base      <- file.path(wd_mrna, "output", tissue)
+  all_dated <- sort(
+    list.dirs(base, full.names = TRUE, recursive = FALSE)[
+      grepl("^\\d{4}-\\d{2}-\\d{2}$",
+            basename(list.dirs(base, full.names = TRUE, recursive = FALSE)))],
+    decreasing = TRUE
+  )
+  for (d in all_dated) {
+    f <- file.path(d, fname)
+    if (file.exists(f)) return(f)
+  }
+  stop(paste("nonzero_Log2TPM.csv not found:", tissue))
+}
+
+symbol_to_entrez <- function(symbols) {
+  ids <- mapIds(org.Mm.eg.db, keys = unique(symbols),
+                column = "ENTREZID", keytype = "SYMBOL",
+                multiVals = "first")
+  unname(ids[!is.na(ids)])
+}
+
+# Run GO BP enrichment with simplify(); return NULL if no significant results
+run_go <- function(genes, universe) {
+  if (length(genes) < MIN_GENES) return(NULL)
+  res <- tryCatch(
+    enrichGO(
+      gene          = genes,
+      universe      = universe,
+      OrgDb         = org.Mm.eg.db,
+      ont           = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = PVAL_CUTOFF,
+      qvalueCutoff  = QVAL_CUTOFF,
+      minGSSize     = MIN_GSET,
+      maxGSSize     = MAX_GSET,
+      readable      = TRUE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(res) || nrow(res@result) == 0 ||
+      sum(res@result$p.adjust < PVAL_CUTOFF) == 0) return(NULL)
+  # Reduce redundant GO terms by semantic similarity
+  res <- tryCatch(
+    clusterProfiler::simplify(res, cutoff = 0.7, by = "p.adjust", select_fun = min),
+    error = function(e) res   # fall back to unsimplified if simplify fails
+  )
+  if (nrow(res@result) == 0) return(NULL)
+  res
+}
+
+# Run KEGG enrichment; return NULL if no significant results
+run_kegg <- function(genes, universe) {
+  if (length(genes) < MIN_GENES) return(NULL)
+  res <- tryCatch(
+    enrichKEGG(
+      gene          = genes,
+      universe      = universe,
+      organism      = "mmu",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = PVAL_CUTOFF,
+      qvalueCutoff  = QVAL_CUTOFF,
+      minGSSize     = MIN_GSET,
+      maxGSSize     = MAX_GSET
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(res) || nrow(res@result) == 0 ||
+      sum(res@result$p.adjust < PVAL_CUTOFF) == 0) return(NULL)
+  res <- setReadable(res, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+  # Strip species annotation from KEGG pathway descriptions
+  res@result$Description <- sub(" - Mus musculus \\(house mouse\\)", "",
+                                 res@result$Description)
+  # Keep only significant rows (simplify() is GO-specific; filter manually for KEGG)
+  res@result <- res@result %>% filter(p.adjust < PVAL_CUTOFF)
+  res
+}
+
+# Run MSigDB enrichment via enricher(); return NULL if no significant results
+# term2gene: data.frame with columns gs_name, entrez_gene (from msigdbr)
+run_msigdb <- function(genes, universe, term2gene) {
+  if (length(genes) < MIN_GENES || nrow(term2gene) == 0) return(NULL)
+  res <- tryCatch(
+    enricher(
+      gene          = genes,
+      universe      = universe,
+      TERM2GENE     = term2gene,
+      pAdjustMethod = "BH",
+      pvalueCutoff  = PVAL_CUTOFF,
+      qvalueCutoff  = QVAL_CUTOFF,
+      minGSSize     = MIN_GSET,
+      maxGSSize     = MAX_GSET
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(res) || nrow(res@result) == 0 ||
+      sum(res@result$p.adjust < PVAL_CUTOFF) == 0) return(NULL)
+  res <- tryCatch(
+    setReadable(res, OrgDb = org.Mm.eg.db, keyType = "ENTREZID"),
+    error = function(e) res
+  )
+  res@result <- res@result %>% filter(p.adjust < PVAL_CUTOFF)
+  res
+}
+
+# Run Reactome pathway enrichment; return NULL if no significant results
+run_reactome <- function(genes, universe) {
+  if (length(genes) < MIN_GENES) return(NULL)
+  res <- tryCatch(
+    ReactomePA::enrichPathway(
+      gene          = genes,
+      universe      = universe,
+      organism      = "mouse",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = PVAL_CUTOFF,
+      qvalueCutoff  = QVAL_CUTOFF,
+      minGSSize     = MIN_GSET,
+      maxGSSize     = MAX_GSET,
+      readable      = TRUE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(res) || nrow(res@result) == 0 ||
+      sum(res@result$p.adjust < PVAL_CUTOFF) == 0) return(NULL)
+  res@result <- res@result %>% filter(p.adjust < PVAL_CUTOFF)
+  res
+}
+
+# dotplot wrapper with cluster color and guard
+safe_dotplot <- function(res, title, col, n = 20) {
+  if (is.null(res) || nrow(as.data.frame(res)) == 0) return(invisible(NULL))
+  dotplot(res, showCategory = n, font.size = 10) +
+    scale_color_gradient(low = unname(col), high = "grey30") +
+    labs(title = title) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 11))
+}
+```
+
+# 4. Load data
+
+## 4-1. Union miRNA–mRNA pairs
+
+```{r load_pairs}
+union_csv <- find_union_pairs_csv()
+cat("Using:", union_csv, "\n")
+
+pairs <- read.csv(union_csv, stringsAsFactors = FALSE)
+cat("Total pairs:", nrow(pairs), "\n")
+cat("Tissues     :", paste(sort(unique(pairs$tissue)),        collapse = ", "), "\n")
+cat("miRNA clust :", paste(sort(unique(pairs$miRNA_cluster)), collapse = ", "), "\n")
+```
+
+## 4-2. Tissue-specific universes (all detected genes)
+
+```{r universe}
+# Universe = all genes detected in each tissue (nonzero Log2TPM across any sample)
+# Source: {tissue}_nonzero_Log2TPM.csv — long format with entrezid column
+tissue_universe <- setNames(
+  lapply(tissues, function(tis) {
+    f <- tryCatch(find_nonzero_csv(tis), error = function(e) NULL)
+    if (is.null(f)) { cat("Skipped (file not found):", tis, "\n"); return(NULL) }
+    df     <- read.csv(f, stringsAsFactors = FALSE)
+    entrez <- unique(df$entrezid[!is.na(df$entrezid) & df$entrezid != ""])
+    entrez <- as.character(entrez)
+    cat(tis, "| detected genes:", n_distinct(df$symbol),
+        "| Entrez IDs:", length(entrez), "\n")
+    entrez
+  }),
+  tissues
+)
+
+tissue_universe <- Filter(Negate(is.null), tissue_universe)
+cat("\nTissues with universe loaded:", paste(names(tissue_universe), collapse = ", "), "\n")
+```
+
+# 5. Gene lists per tissue × miRNA cluster
+
+```{r gene_lists}
+# Nested list: tissue -> miRNA_cluster -> Entrez IDs
+tissue_cluster_genes <- lapply(names(tissue_universe), function(tis) {
+  tis_pairs <- pairs %>% filter(tissue == tis)
+  if (nrow(tis_pairs) == 0) return(NULL)
+
+  clusts <- sort(unique(tis_pairs$miRNA_cluster))
+  genes_by_clust <- setNames(
+    lapply(clusts, function(cl) {
+      syms   <- unique(tis_pairs$SYMBOL[tis_pairs$miRNA_cluster == cl])
+      entrez <- symbol_to_entrez(syms)
+      entrez
+    }),
+    as.character(clusts)
+  )
+  genes_by_clust
+})
+names(tissue_cluster_genes) <- names(tissue_universe)
+
+# Summary table
+summary_tbl <- bind_rows(lapply(names(tissue_cluster_genes), function(tis) {
+  gc <- tissue_cluster_genes[[tis]]
+  if (is.null(gc)) return(NULL)
+  bind_rows(lapply(names(gc), function(cl) {
+    tibble(tissue = tis, miRNA_cluster = cl, n_genes = length(gc[[cl]]))
+  }))
+}))
+
+cat("Pairs per tissue × miRNA cluster (Entrez-mapped genes):\n")
+summary_tbl %>%
+  pivot_wider(names_from = miRNA_cluster, values_from = n_genes,
+              names_prefix = "clust_", values_fill = 0) %>%
+  print()
+```
+
+# 6. GO enrichment (Biological Process) per tissue
+
+```{r go_bp_by_tissue, results="asis", fig.height=8, fig.width=10}
+go_all_results <- list()
+
+for (tis in names(tissue_universe)) {
+  gc      <- tissue_cluster_genes[[tis]]
+  univ    <- tissue_universe[[tis]]
+  clusts  <- names(gc)
+
+  cat("\n\n## GO BP —", tis, "\n\n")
+
+  res_list <- setNames(
+    lapply(clusts, function(cl) {
+      g   <- gc[[cl]]
+      cat("  cluster", cl, "| n_genes =", length(g), "→ ")
+      res <- run_go(g, univ)
+      cat(if (is.null(res)) "no result\n"
+          else paste(sum(res@result$p.adjust < PVAL_CUTOFF), "terms\n"))
+      res
+    }),
+    clusts
+  )
+
+  # Per-cluster dotplots
+  for (cl in clusts) {
+    res <- res_list[[cl]]
+    p   <- safe_dotplot(res,
+                        title = paste0("GO BP — ", tis, " / miRNA cluster ", cl),
+                        col   = cluster_colors[cl])
+    if (!is.null(p)) {
+      print(p)
+      ggsave(file.path(dir_go,
+                       paste0("GO_BP_", tis, "_cluster", cl, ".svg")),
+             p, width = 10, height = 8)
+    }
+  }
+
+  go_all_results[[tis]] <- res_list
+}
+```
+
+## GO BP combined table
+
+```{r go_bp_table}
+go_bp_all <- bind_rows(lapply(names(go_all_results), function(tis) {
+  bind_rows(lapply(names(go_all_results[[tis]]), function(cl) {
+    res <- go_all_results[[tis]][[cl]]
+    if (is.null(res)) return(NULL)
+    as.data.frame(res@result) %>%
+      filter(p.adjust < PVAL_CUTOFF) %>%
+      mutate(tissue = tis, miRNA_cluster = cl)
+  }))
+}))
+
+if (nrow(go_bp_all) > 0) {
+  write.csv(go_bp_all,
+            file.path(dir_go, "GO_BP_tissue_cluster_all.csv"),
+            row.names = FALSE)
+  cat("Saved: GO/GO_BP_tissue_cluster_all.csv (", nrow(go_bp_all), "terms)\n")
+  go_bp_all %>%
+    dplyr::select(tissue, miRNA_cluster, ID, Description, GeneRatio, p.adjust, geneID) %>%
+    arrange(tissue, miRNA_cluster, p.adjust) %>%
+    head(40) %>%
+    print()
+} else {
+  cat("No significant GO BP terms.\n")
+}
+```
+
+# 7. KEGG enrichment per tissue
+
+```{r kegg_by_tissue, results="asis", fig.height=8, fig.width=10}
+kegg_all_results <- list()
+
+for (tis in names(tissue_universe)) {
+  gc     <- tissue_cluster_genes[[tis]]
+  univ   <- tissue_universe[[tis]]
+  clusts <- names(gc)
+
+  cat("\n\n## KEGG —", tis, "\n\n")
+
+  res_list <- setNames(
+    lapply(clusts, function(cl) {
+      g   <- gc[[cl]]
+      cat("  cluster", cl, "| n_genes =", length(g), "→ ")
+      res <- run_kegg(g, univ)
+      cat(if (is.null(res)) "no result\n"
+          else paste(sum(res@result$p.adjust < PVAL_CUTOFF), "pathways\n"))
+      res
+    }),
+    clusts
+  )
+
+  # Per-cluster dotplots
+  for (cl in clusts) {
+    res <- res_list[[cl]]
+    p   <- safe_dotplot(res,
+                        title = paste0("KEGG — ", tis, " / miRNA cluster ", cl),
+                        col   = cluster_colors[cl])
+    if (!is.null(p)) {
+      print(p)
+      ggsave(file.path(dir_kegg,
+                       paste0("KEGG_", tis, "_cluster", cl, ".svg")),
+             p, width = 10, height = 8)
+    }
+  }
+
+  kegg_all_results[[tis]] <- res_list
+}
+```
+
+## KEGG combined table
+
+```{r kegg_table}
+kegg_all <- bind_rows(lapply(names(kegg_all_results), function(tis) {
+  bind_rows(lapply(names(kegg_all_results[[tis]]), function(cl) {
+    res <- kegg_all_results[[tis]][[cl]]
+    if (is.null(res)) return(NULL)
+    as.data.frame(res@result) %>%
+      filter(p.adjust < PVAL_CUTOFF) %>%
+      mutate(tissue = tis, miRNA_cluster = cl)
+  }))
+}))
+
+if (nrow(kegg_all) > 0) {
+  write.csv(kegg_all,
+            file.path(dir_kegg, "KEGG_tissue_cluster_all.csv"),
+            row.names = FALSE)
+  cat("Saved: KEGG/KEGG_tissue_cluster_all.csv (", nrow(kegg_all), "pathways)\n")
+  kegg_all %>%
+    dplyr::select(tissue, miRNA_cluster, ID, Description, GeneRatio, p.adjust, geneID) %>%
+    arrange(tissue, miRNA_cluster, p.adjust) %>%
+    head(40) %>%
+    print()
+} else {
+  cat("No significant KEGG pathways.\n")
+}
+```
+
+# 8. MSigDB enrichment per tissue
+
+```{r msigdb_load}
+# Load MSigDB gene sets (Entrez ID format) for all specified collections
+msigdb_term2gene <- lapply(MSIGDB_SETS, function(s) {
+  df <- if (is.null(s$subcategory))
+    msigdbr(species = "Mus musculus", category = s$category)
+  else
+    msigdbr(species = "Mus musculus", category = s$category,
+            subcategory = s$subcategory)
+  t2g <- df %>%
+    dplyr::select(gs_name, entrez_gene) %>%
+    mutate(entrez_gene = as.character(entrez_gene)) %>%
+    distinct()
+  cat(s$label, "| gene sets:", n_distinct(t2g$gs_name), "\n")
+  list(label = s$label, term2gene = t2g)
+})
+names(msigdb_term2gene) <- sapply(MSIGDB_SETS, `[[`, "label")
+```
+
+```{r msigdb_by_tissue, results="asis", fig.height=8, fig.width=10}
+msigdb_all_results <- list()
+
+for (tis in names(tissue_universe)) {
+  gc     <- tissue_cluster_genes[[tis]]
+  univ   <- tissue_universe[[tis]]
+  clusts <- names(gc)
+
+  cat("\n\n## MSigDB —", tis, "\n\n")
+  tis_results <- list()
+
+  for (s_name in names(msigdb_term2gene)) {
+    t2g      <- msigdb_term2gene[[s_name]]$term2gene
+    cat(" [", s_name, "]\n")
+
+    res_list <- setNames(
+      lapply(clusts, function(cl) {
+        g   <- gc[[cl]]
+        cat("  cluster", cl, "| n =", length(g), "→ ")
+        res <- run_msigdb(g, univ, t2g)
+        cat(if (is.null(res)) "no result\n"
+            else paste(nrow(res@result), "terms\n"))
+        res
+      }),
+      clusts
+    )
+
+    for (cl in clusts) {
+      res <- res_list[[cl]]
+      p   <- safe_dotplot(res,
+                          title = paste0(s_name, " — ", tis, " / cluster ", cl),
+                          col   = cluster_colors[cl])
+      if (!is.null(p)) {
+        print(p)
+        ggsave(file.path(dir_msigdb,
+                         paste0(s_name, "_", tis, "_cluster", cl, ".svg")),
+               p, width = 10, height = 8)
+      }
+    }
+    tis_results[[s_name]] <- res_list
+  }
+  msigdb_all_results[[tis]] <- tis_results
+}
+```
+
+## MSigDB combined table
+
+```{r msigdb_table}
+msigdb_all <- bind_rows(lapply(names(msigdb_all_results), function(tis) {
+  bind_rows(lapply(names(msigdb_all_results[[tis]]), function(s_name) {
+    bind_rows(lapply(names(msigdb_all_results[[tis]][[s_name]]), function(cl) {
+      res <- msigdb_all_results[[tis]][[s_name]][[cl]]
+      if (is.null(res)) return(NULL)
+      as.data.frame(res@result) %>%
+        mutate(tissue = tis, miRNA_cluster = cl, msigdb_set = s_name)
+    }))
+  }))
+}))
+
+if (nrow(msigdb_all) > 0) {
+  write.csv(msigdb_all,
+            file.path(dir_msigdb, "MSigDB_tissue_cluster_all.csv"),
+            row.names = FALSE)
+  cat("Saved: MSigDB/MSigDB_tissue_cluster_all.csv (", nrow(msigdb_all), "terms)\n")
+  msigdb_all %>%
+    dplyr::select(tissue, miRNA_cluster, msigdb_set, ID, Description, GeneRatio, p.adjust) %>%
+    arrange(tissue, miRNA_cluster, msigdb_set, p.adjust) %>%
+    head(40) %>% print()
+} else {
+  cat("No significant MSigDB terms.\n")
+}
+```
+
+# 9. Reactome enrichment per tissue
+
+```{r reactome_by_tissue, results="asis", fig.height=8, fig.width=10}
+reactome_all_results <- list()
+
+for (tis in names(tissue_universe)) {
+  gc     <- tissue_cluster_genes[[tis]]
+  univ   <- tissue_universe[[tis]]
+  clusts <- names(gc)
+
+  cat("\n\n## Reactome —", tis, "\n\n")
+
+  res_list <- setNames(
+    lapply(clusts, function(cl) {
+      g   <- gc[[cl]]
+      cat("  cluster", cl, "| n =", length(g), "→ ")
+      res <- run_reactome(g, univ)
+      cat(if (is.null(res)) "no result\n"
+          else paste(nrow(res@result), "pathways\n"))
+      res
+    }),
+    clusts
+  )
+
+  for (cl in clusts) {
+    res <- res_list[[cl]]
+    p   <- safe_dotplot(res,
+                        title = paste0("Reactome — ", tis, " / cluster ", cl),
+                        col   = cluster_colors[cl])
+    if (!is.null(p)) {
+      print(p)
+      ggsave(file.path(dir_reactome,
+                       paste0("Reactome_", tis, "_cluster", cl, ".svg")),
+             p, width = 10, height = 8)
+    }
+  }
+  reactome_all_results[[tis]] <- res_list
+}
+```
+
+## Reactome combined table
+
+```{r reactome_table}
+reactome_all <- bind_rows(lapply(names(reactome_all_results), function(tis) {
+  bind_rows(lapply(names(reactome_all_results[[tis]]), function(cl) {
+    res <- reactome_all_results[[tis]][[cl]]
+    if (is.null(res)) return(NULL)
+    as.data.frame(res@result) %>%
+      mutate(tissue = tis, miRNA_cluster = cl)
+  }))
+}))
+
+if (nrow(reactome_all) > 0) {
+  write.csv(reactome_all,
+            file.path(dir_reactome, "Reactome_tissue_cluster_all.csv"),
+            row.names = FALSE)
+  cat("Saved: Reactome/Reactome_tissue_cluster_all.csv (", nrow(reactome_all), "pathways)\n")
+  reactome_all %>%
+    dplyr::select(tissue, miRNA_cluster, ID, Description, GeneRatio, p.adjust, geneID) %>%
+    arrange(tissue, miRNA_cluster, p.adjust) %>%
+    head(40) %>% print()
+} else {
+  cat("No significant Reactome pathways.\n")
+}
+```
+
+# 10. Summary
+
+```{r summary}
+# Helper: parse "k/n" GeneRatio string → numeric
+parse_generatio <- function(gr) {
+  sapply(gr, function(x) {
+    v <- as.numeric(strsplit(x, "/")[[1]])
+    if (length(v) == 2) v[1] / v[2] else NA_real_
+  })
+}
+
+# Count of significant terms per tissue × cluster
+go_summary <- if (nrow(go_bp_all) > 0)
+  go_bp_all %>% count(tissue, miRNA_cluster, name = "n_GO_terms") else
+  tibble(tissue = character(), miRNA_cluster = character(), n_GO_terms = integer())
+
+kegg_summary <- if (nrow(kegg_all) > 0)
+  kegg_all %>% count(tissue, miRNA_cluster, name = "n_KEGG_pathways") else
+  tibble(tissue = character(), miRNA_cluster = character(), n_KEGG_pathways = integer())
+
+combined_summary <- full_join(go_summary, kegg_summary,
+                              by = c("tissue", "miRNA_cluster")) %>%
+  replace_na(list(n_GO_terms = 0L, n_KEGG_pathways = 0L)) %>%
+  arrange(tissue, miRNA_cluster)
+
+cat("=== Significant results per tissue × miRNA cluster ===\n")
+print(as_tibble(combined_summary), n = Inf)
+
+write.csv(combined_summary,
+          file.path(dir_output, "summary_GO_KEGG_counts.csv"),
+          row.names = FALSE)
+cat("Saved: summary_GO_KEGG_counts.csv\n")
+
+# Top 3 GO terms and KEGG pathways per tissue × cluster
+go_top <- if (nrow(go_bp_all) > 0)
+  go_bp_all %>%
+    group_by(tissue, miRNA_cluster) %>%
+    slice_min(p.adjust, n = 3, with_ties = FALSE) %>%
+    summarise(top_GO = paste(Description, collapse = " | "), .groups = "drop") else
+  tibble(tissue = character(), miRNA_cluster = character(), top_GO = character())
+
+kegg_top <- if (nrow(kegg_all) > 0)
+  kegg_all %>%
+    group_by(tissue, miRNA_cluster) %>%
+    slice_min(p.adjust, n = 3, with_ties = FALSE) %>%
+    summarise(top_KEGG = paste(Description, collapse = " | "), .groups = "drop") else
+  tibble(tissue = character(), miRNA_cluster = character(), top_KEGG = character())
+
+top_summary <- full_join(go_top, kegg_top, by = c("tissue", "miRNA_cluster")) %>%
+  arrange(tissue, miRNA_cluster)
+
+cat("\n=== Top 3 terms per tissue × cluster ===\n")
+print(as_tibble(top_summary), n = Inf)
+
+write.csv(top_summary,
+          file.path(dir_output, "summary_top_terms.csv"),
+          row.names = FALSE)
+cat("Saved: summary_top_terms.csv\n")
+```
+
+# 11. Integrated GO + KEGG + MSigDB + Reactome compare plot per tissue
+
+```{r integrated_compare, fig.height=12, fig.width=14}
+TOP_N <- 5   # top N terms per source per cluster
+
+# Fixed x-axis: all 5 miRNA clusters, always shown
+ALL_CLUSTERS       <- as.character(1:5)
+ALL_CLUSTER_LABELS <- paste0("cluster ", ALL_CLUSTERS)
+
+# Source display order in facet
+SOURCE_LEVELS <- c("GO BP", "KEGG", "Reactome",
+                   paste0("MSigDB:", names(msigdb_term2gene)))
+
+for (tis in names(tissue_universe)) {
+  go_tis       <- if (nrow(go_bp_all)    > 0) filter(go_bp_all,    tissue == tis) else data.frame()
+  kegg_tis     <- if (nrow(kegg_all)     > 0) filter(kegg_all,     tissue == tis) else data.frame()
+  reactome_tis <- if (nrow(reactome_all) > 0) filter(reactome_all, tissue == tis) else data.frame()
+
+  # MSigDB: flatten all collections for this tissue
+  msigdb_tis <- if (nrow(msigdb_all) > 0)
+    filter(msigdb_all, tissue == tis) %>%
+      mutate(source_full = paste0("MSigDB:", msigdb_set)) else
+    data.frame()
+
+  make_top <- function(df, src) {
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    df %>%
+      group_by(miRNA_cluster) %>%
+      slice_min(p.adjust, n = TOP_N, with_ties = FALSE) %>%
+      ungroup() %>%
+      mutate(source      = src,
+             GeneRatio_n = parse_generatio(GeneRatio),
+             term_label  = Description)
+  }
+
+  # Build per-source top-N frames
+  msigdb_rows <- if (nrow(msigdb_tis) > 0)
+    bind_rows(lapply(unique(msigdb_tis$msigdb_set), function(s) {
+      make_top(filter(msigdb_tis, msigdb_set == s), paste0("MSigDB:", s))
+    })) else NULL
+
+  combined <- bind_rows(
+    make_top(go_tis,       "GO BP"),
+    make_top(kegg_tis,     "KEGG"),
+    make_top(reactome_tis, "Reactome"),
+    msigdb_rows
+  )
+  if (is.null(combined) || nrow(combined) == 0) {
+    cat("No results for", tis, "— skipped\n"); next
+  }
+
+  # Term label order within each source (top p.adjust → bottom), reversed for y-axis
+  term_order <- combined %>%
+    arrange(source, p.adjust) %>%
+    distinct(source, term_label) %>%
+    pull(term_label) %>% rev()
+
+  combined <- combined %>%
+    mutate(
+      term_label    = factor(term_label, levels = unique(term_order)),
+      cluster_label = factor(paste0("cluster ", miRNA_cluster),
+                             levels = ALL_CLUSTER_LABELS),
+      source        = factor(source,
+                             levels = intersect(SOURCE_LEVELS, unique(source)))
+    )
+
+  p <- ggplot(combined,
+              aes(x = cluster_label, y = term_label,
+                  size = GeneRatio_n, color = p.adjust)) +
+    geom_point() +
+    scale_x_discrete(drop = FALSE) +
+    scale_color_gradient(low = "#d73027", high = "#4575b4", name = "p.adjust") +
+    scale_size_continuous(name = "GeneRatio", range = c(2, 8)) +
+    facet_grid(source ~ ., scales = "free_y", space = "free_y") +
+    labs(title = paste0("GO BP + KEGG + MSigDB + Reactome — ", tis),
+         x = NULL, y = NULL) +
+    theme_bw(base_size = 10) +
+    theme(
+      plot.title    = element_text(face = "bold", hjust = 0.5, size = 12),
+      axis.text.x   = element_text(angle = 30, hjust = 1, face = "bold"),
+      axis.text.y   = element_text(size = 8),
+      strip.text    = element_text(face = "bold", size = 9),
+      panel.spacing = unit(0.4, "lines")
+    )
+
+  print(p)
+
+  h <- max(8, n_distinct(combined$term_label) * 0.32 + 4)
+  ggsave(file.path(dir_output, paste0("all_pathway_compare_", tis, ".svg")),
+         p, width = 14, height = h)
+  cat("Saved: all_pathway_compare_", tis, ".svg\n", sep = "")
+}
+```
+
+# 12. Shared genes across pathway databases per tissue × cluster
+
+```{r shared_pathway_genes}
+# Extract gene symbols from an enrichResult's significant rows
+# geneID column is "/" separated symbols (after setReadable / readable=TRUE)
+extract_genes <- function(res) {
+  if (is.null(res)) return(character(0))
+  df <- tryCatch(as.data.frame(res), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) return(character(0))
+  ids <- df$geneID[!is.na(df$geneID) & df$geneID != ""]
+  unique(unlist(strsplit(ids, "/")))
+}
+
+# Source names (all databases)
+src_go       <- "GO_BP"
+src_kegg     <- "KEGG"
+src_reactome <- "Reactome"
+msigdb_src_names <- paste0("MSigDB_", names(msigdb_term2gene))
+
+shared_rows <- bind_rows(lapply(names(tissue_universe), function(tis) {
+  gc     <- tissue_cluster_genes[[tis]]
+  clusts <- names(gc)
+
+  bind_rows(lapply(clusts, function(cl) {
+    # Collect gene sets per source
+    gene_sets <- list()
+    gene_sets[[src_go]]       <- extract_genes(go_all_results[[tis]][[cl]])
+    gene_sets[[src_kegg]]     <- extract_genes(kegg_all_results[[tis]][[cl]])
+    gene_sets[[src_reactome]] <- extract_genes(reactome_all_results[[tis]][[cl]])
+
+    for (s_name in names(msigdb_term2gene)) {
+      key <- paste0("MSigDB_", s_name)
+      gene_sets[[key]] <- extract_genes(
+        msigdb_all_results[[tis]][[s_name]][[cl]]
+      )
+    }
+
+    all_genes <- unique(unlist(gene_sets))
+    if (length(all_genes) == 0) return(NULL)
+
+    # Binary presence per source
+    presence <- as.data.frame(
+      lapply(gene_sets, function(gs) all_genes %in% gs),
+      check.names = FALSE
+    )
+    presence$SYMBOL        <- all_genes
+    presence$n_sources     <- rowSums(presence[, names(gene_sets)])
+    presence$sources       <- apply(
+      presence[, names(gene_sets)], 1,
+      function(row) paste(names(gene_sets)[as.logical(row)], collapse = ";")
+    )
+    presence$tissue        <- tis
+    presence$miRNA_cluster <- cl
+
+    # Keep only genes shared across ≥2 sources
+    presence %>%
+      filter(n_sources >= 2) %>%
+      dplyr::select(tissue, miRNA_cluster, SYMBOL, n_sources, sources,
+                    all_of(names(gene_sets))) %>%
+      arrange(desc(n_sources), SYMBOL)
+  }))
+}))
+
+if (nrow(shared_rows) > 0) {
+  write.csv(shared_rows,
+            file.path(dir_output, "shared_genes_across_databases.csv"),
+            row.names = FALSE)
+  cat("Saved: shared_genes_across_databases.csv (", nrow(shared_rows), "rows)\n\n")
+
+  # Summary: count of shared genes per tissue × cluster
+  cat("=== Shared genes (≥2 databases) per tissue × cluster ===\n")
+  shared_rows %>%
+    count(tissue, miRNA_cluster, name = "n_shared_genes") %>%
+    pivot_wider(names_from = miRNA_cluster, values_from = n_shared_genes,
+                names_prefix = "clust_", values_fill = 0L) %>%
+    print()
+
+  # Top shared genes (most databases)
+  cat("\n=== Top shared genes (most databases) ===\n")
+  shared_rows %>%
+    group_by(SYMBOL) %>%
+    summarise(
+      n_tissue_cluster = n(),
+      max_sources      = max(n_sources),
+      databases        = paste(sort(unique(unlist(strsplit(sources, ";")))),
+                               collapse = ";"),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(max_sources), desc(n_tissue_cluster)) %>%
+    head(30) %>%
+    print()
+} else {
+  cat("No genes shared across ≥2 pathway databases.\n")
+}
+```
+
+# Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

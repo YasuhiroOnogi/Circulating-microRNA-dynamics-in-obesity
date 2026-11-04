@@ -1,0 +1,593 @@
+---
+title: "miRNA target coverage of tissue-specific DEGs"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.height = 5, fig.width = 9, dpi = 150)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna  <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+wd_mrna   <- "F:/wd/Mm_Bulk_RNA-seq"
+dir_ref   <- "F:/wd/cohort7_miRNAs/ref"
+
+tissues   <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+MIRDB_SCORE_CUTOFF <- 80
+TS_CONTEXT_CUTOFF  <- -0.2
+COS_THRESHOLD      <- -0.6
+
+TISSUE_ORDER <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+CLUST_COLORS <- c("1" = "#B3E2CD", "2" = "#FDCDAC", "3" = "#CBD5E8",
+                  "4" = "#F4CAE4", "5" = "#FFF2AE")
+
+dir_out <- file.path(wd_mirna, "output", "02.4_DEG_coverage")
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory:", dir_out, "\n")
+```
+
+# 3. Helper functions
+
+```{r helpers}
+find_masigpro_dir <- function(tissue) {
+  base      <- file.path(wd_mrna, "output", tissue)
+  all_dated <- list.dirs(base, full.names = TRUE, recursive = FALSE)
+  all_dated <- all_dated[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(all_dated))]
+  all_dated <- sort(all_dated, decreasing = TRUE)
+  for (d in all_dated) {
+    cand <- file.path(d, "maSigPro_rsq0.7_d3")
+    if (dir.exists(cand)) return(cand)
+  }
+  stop(paste("maSigPro_rsq0.7_d3 not found:", tissue))
+}
+
+find_mirna_masigpro_dir <- function() {
+  base      <- file.path(wd_mirna, "output", "01_maSigPro")
+  all_dated <- sort(list.dirs(base, full.names = TRUE, recursive = FALSE),
+                    decreasing = TRUE)
+  for (d in all_dated) {
+    if (length(list.files(d, pattern = "^Plasma_miRNA_ids_clst_")) > 0) return(d)
+  }
+  stop("miRNA maSigPro output not found")
+}
+
+# Find latest 02_integration output directory
+find_integration_dir <- function() {
+  base <- file.path(wd_mirna, "output", "02_integration")
+  all_dated <- sort(list.dirs(base, full.names = TRUE, recursive = FALSE),
+                    decreasing = TRUE)
+  for (d in all_dated) {
+    if (dir.exists(file.path(d, "union"))) return(d)
+  }
+  stop("No 02_integration output found")
+}
+```
+
+# 4. Load miRNA cluster data
+
+```{r load-mirna-clusters}
+dir_mirna_ms <- find_mirna_masigpro_dir()
+cat("Using miRNA maSigPro dir:", dir_mirna_ms, "\n")
+
+mirna_clst_df <- lapply(1:5, function(i) {
+  f <- file.path(dir_mirna_ms, paste0("Plasma_miRNA_ids_clst_", i, ".csv"))
+  read.csv(f, stringsAsFactors = FALSE)
+}) %>% bind_rows()
+
+detected_miRNAs <- unique(mirna_clst_df$miRNA_Name)
+cat("Detected miRNAs:", length(detected_miRNAs), "\n")
+
+cat("\nCluster breakdown:\n")
+print(table(mirna_clst_df$cluster))
+
+cat("\nmiRNA cluster data (head):\n")
+mirna_clst_df %>% as_tibble() %>% print(n = 10)
+```
+
+# 5. Load DEG mRNA lists per tissue
+
+```{r load-degs}
+deg_mrna <- setNames(
+  lapply(tissues, function(tis) {
+    dir_ms <- tryCatch(find_masigpro_dir(tis), error = function(e) NULL)
+    if (is.null(dir_ms)) { cat("Skipped:", tis, "\n"); return(NULL) }
+    f <- file.path(dir_ms,
+                   paste0(tis, "_maSigPro_mRNA_rsq0.70_hclust.k4.csv"))
+    if (!file.exists(f)) { cat("CSV not found:", tis, "\n"); return(NULL) }
+    df <- read.csv(f, stringsAsFactors = FALSE)
+    if ("gene" %in% colnames(df)) df$gene else df$X
+  }),
+  tissues
+)
+
+deg_mrna <- Filter(Negate(is.null), deg_mrna)
+all_deg_symbols <- unique(unlist(deg_mrna))
+
+cat("Tissues loaded:", length(deg_mrna), "\n")
+cat("Total unique DEG symbols:", length(all_deg_symbols), "\n")
+cat("\nDEGs per tissue:\n")
+print(sapply(deg_mrna, length))
+
+# Display DEG counts as a tidy table
+tibble(
+  tissue  = names(deg_mrna),
+  n_DEG   = sapply(deg_mrna, length)
+) %>%
+  mutate(tissue = factor(tissue, levels = TISSUE_ORDER)) %>%
+  arrange(tissue) %>%
+  print(n = Inf)
+```
+
+# 6. Build miRNA target pair universe
+
+## 6a. miRDB pairs
+
+```{r mirdb-pairs}
+miRDB_raw <- read_tsv(
+  file.path(dir_ref, "miRDB_v6.0_prediction_result.txt"),
+  show_col_types = FALSE
+) %>%
+  filter(miRNA_Name %in% detected_miRNAs)
+
+refseq_to_symbol <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys    = unique(miRDB_raw$REFSEQ),
+  columns = "SYMBOL",
+  keytype = "REFSEQ"
+) %>%
+  filter(!is.na(SYMBOL)) %>%
+  distinct(REFSEQ, SYMBOL)
+
+miRDB_base <- miRDB_raw %>%
+  left_join(refseq_to_symbol, by = "REFSEQ") %>%
+  filter(!is.na(SYMBOL), SYMBOL %in% all_deg_symbols)
+
+# No score filter — permissive union basis
+miRDB_pairs_all <- miRDB_base %>%
+  distinct(miRNA_Name, SYMBOL) %>%
+  mutate(pair_id = paste(miRNA_Name, SYMBOL, sep = "__"))
+
+# Score-filtered
+miRDB_pairs_filt <- miRDB_base %>%
+  filter(Target_Score >= MIRDB_SCORE_CUTOFF) %>%
+  distinct(miRNA_Name, SYMBOL) %>%
+  mutate(pair_id = paste(miRNA_Name, SYMBOL, sep = "__"))
+
+cat("miRDB pairs (all)      :", nrow(miRDB_pairs_all), "\n")
+cat("miRDB pairs (score>=80):", nrow(miRDB_pairs_filt), "\n")
+
+cat("\nmiRDB pairs (score>=80, head):\n")
+miRDB_pairs_filt %>% as_tibble() %>% print(n = 10)
+```
+
+## 6b. TargetScan pairs
+
+```{r targetscan-pairs}
+ts_scores <- read_tsv(
+  file.path(dir_ref, "TargetScan_v8.0/mouse/Predicted_Targets_Context_Scores_mmu.txt"),
+  show_col_types = FALSE
+)
+
+ts_base <- ts_scores %>%
+  filter(miRNA %in% detected_miRNAs,
+         `Gene Symbol` %in% all_deg_symbols)
+
+TargetScan_pairs_all <- ts_base %>%
+  distinct(miRNA_Name = miRNA, SYMBOL = `Gene Symbol`) %>%
+  mutate(pair_id = paste(miRNA_Name, SYMBOL, sep = "__"))
+
+TargetScan_pairs_filt <- ts_base %>%
+  filter(`weighted context++ score` <= TS_CONTEXT_CUTOFF) %>%
+  distinct(miRNA_Name = miRNA, SYMBOL = `Gene Symbol`) %>%
+  mutate(pair_id = paste(miRNA_Name, SYMBOL, sep = "__"))
+
+cat("TargetScan pairs (all)              :", nrow(TargetScan_pairs_all), "\n")
+cat("TargetScan pairs (context++<=-0.2)  :", nrow(TargetScan_pairs_filt), "\n")
+
+cat("\nTargetScan pairs (context++<=-0.2, head):\n")
+TargetScan_pairs_filt %>% as_tibble() %>% print(n = 10)
+```
+
+## 6c. Union and intersection pair sets
+
+```{r pair-sets}
+# Tier 1: union (any prediction, no score filter)
+union_pairs <- bind_rows(miRDB_pairs_all, TargetScan_pairs_all) %>%
+  distinct(miRNA_Name, SYMBOL)
+
+# Tier 2: intersection (both databases, with score filter)
+intersect_pair_ids <- intersect(miRDB_pairs_filt$pair_id,
+                                TargetScan_pairs_filt$pair_id)
+intersect_pairs <- miRDB_pairs_filt %>%
+  filter(pair_id %in% intersect_pair_ids) %>%
+  dplyr::select(miRNA_Name, SYMBOL)
+
+cat("Union pairs (Tier 1) :", nrow(union_pairs), " | unique SYMBOL:", n_distinct(union_pairs$SYMBOL), "\n")
+cat("Intersect pairs (Tier 2):", nrow(intersect_pairs), " | unique SYMBOL:", n_distinct(intersect_pairs$SYMBOL), "\n")
+```
+
+# 7. Load negative cosine pairs from 02\_ output
+
+```{r load-neg-cosine}
+dir_int <- find_integration_dir()
+cat("Using 02_integration output:", dir_int, "\n")
+
+neg_union_csv      <- file.path(dir_int, "union",
+                                "negative_cosine_pairs_union.csv")
+neg_intersect_csv  <- file.path(dir_int, "intersection",
+                                "negative_cosine_pairs_intersection.csv")
+
+neg_union     <- read.csv(neg_union_csv,     stringsAsFactors = FALSE)
+neg_intersect <- read.csv(neg_intersect_csv, stringsAsFactors = FALSE)
+
+cat("Tier 3 neg-cosine pairs (union basis)     :",
+    nrow(neg_union), " | unique SYMBOL:", n_distinct(neg_union$SYMBOL), "\n")
+cat("Tier 3 neg-cosine pairs (intersect basis) :",
+    nrow(neg_intersect), " | unique SYMBOL:", n_distinct(neg_intersect$SYMBOL), "\n")
+
+cat("\nNeg-cosine pairs — union (head):\n")
+neg_union %>% as_tibble() %>% print(n = 10)
+
+cat("\nNeg-cosine pairs — intersection (head):\n")
+neg_intersect %>% as_tibble() %>% print(n = 10)
+
+cat("\nPairs per tissue (union, neg cosine):\n")
+print(sort(table(neg_union$tissue), decreasing = TRUE))
+```
+
+# 8. Coverage computation per tissue
+
+```{r coverage-table}
+# For each tissue:
+#   denominator = n DEGs
+#   Tier 1 = DEGs in union_pairs (any prediction)
+#   Tier 2 = DEGs in intersect_pairs (both DBs, score filter)
+#   Tier 3 = DEGs in neg_union (cosine < -0.6, union-based)
+
+coverage_tbl <- bind_rows(lapply(names(deg_mrna), function(tis) {
+  degs <- unique(deg_mrna[[tis]])
+  n_deg <- length(degs)
+
+  n_tier1 <- length(intersect(unique(union_pairs$SYMBOL), degs))
+  n_tier2 <- length(intersect(unique(intersect_pairs$SYMBOL), degs))
+  n_tier3 <- neg_union %>%
+    filter(tissue == tis) %>%
+    pull(SYMBOL) %>% unique() %>% length()
+  n_tier3_int <- neg_intersect %>%
+    filter(tissue == tis) %>%
+    pull(SYMBOL) %>% unique() %>% length()
+
+  tibble(
+    tissue               = tis,
+    n_DEG                = n_deg,
+    n_any_target         = n_tier1,   # Tier 1: any prediction
+    n_filtered_target    = n_tier2,   # Tier 2: both DBs + score filter
+    n_neg_cosine         = n_tier3,   # Tier 3: union + cosine < -0.6
+    n_neg_cosine_strict  = n_tier3_int, # Tier 3b: intersect + cosine < -0.6
+    pct_any_target       = round(n_tier1 / n_deg, 4),
+    pct_filtered_target  = round(n_tier2 / n_deg, 4),
+    pct_neg_cosine       = round(n_tier3 / n_deg, 4),
+    pct_neg_cosine_strict = round(n_tier3_int / n_deg, 4)
+  )
+})) %>%
+  mutate(tissue = factor(tissue, levels = TISSUE_ORDER))
+
+cat("Coverage table:\n")
+coverage_tbl %>% as_tibble() %>% print(n = Inf)
+
+write.csv(coverage_tbl,
+          file.path(dir_out, "DEG_miRNA_target_coverage.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: DEG_miRNA_target_coverage.csv\n")
+```
+
+# 9. Coverage bar charts per tissue
+
+## 9. Compute layer counts per tissue
+
+```{r stack-data}
+BAR_COLORS <- c(
+  "Total DEG"      = "#d9d9d9",
+  "DB match"       = "#9ecae1",
+  "Neg cosine pair" = "#e6550d"
+)
+
+# Wide table: one row per tissue
+stack_wide <- bind_rows(lapply(names(deg_mrna), function(tis) {
+  degs    <- unique(deg_mrna[[tis]])
+  sym_neg <- unique(neg_union$SYMBOL[neg_union$tissue == tis])
+  sym_db  <- unique(union_pairs$SYMBOL)
+
+  n_total <- length(degs)
+  n_db    <- length(intersect(sym_db, degs))
+  n_neg   <- length(intersect(sym_neg, degs))
+
+  tibble(
+    tissue          = tis,
+    n_total         = n_total,
+    n_db            = n_db,
+    n_neg           = n_neg,
+    pct_db_of_total = n_db / n_total,
+    pct_neg_of_db   = n_neg / n_db
+  )
+})) %>%
+  mutate(tissue = factor(tissue, levels = TISSUE_ORDER))
+
+# Long table for grouped bar: 3 bars per tissue
+bar_long <- stack_wide %>%
+  dplyr::select(tissue, n_total, n_db, n_neg,
+                pct_db_of_total, pct_neg_of_db) %>%
+  pivot_longer(c(n_total, n_db, n_neg),
+               names_to = "category", values_to = "n") %>%
+  mutate(
+    category = factor(category,
+                      levels = c("n_total", "n_db", "n_neg"),
+                      labels = c("Total DEG", "DB match", "Neg cosine pair")),
+    # Label: count + relevant proportion
+    bar_label = case_when(
+      category == "Total DEG"       ~
+        as.character(n),
+      category == "DB match"        ~
+        paste0(n, "\n(", scales::percent(pct_db_of_total, accuracy = 1), " of DEG)"),
+      category == "Neg cosine pair" ~
+        paste0(n, "\n(", scales::percent(pct_neg_of_db,   accuracy = 1), " of DB)")
+    )
+  )
+```
+
+## 9a. Grouped bar chart (absolute counts)
+
+a group of three bars: Total DEG (reference), DB match (% of Total DEGs), Negative cosine pair (% of DB match)
+
+```{r bar-grouped, fig.height=5, fig.width=10}
+p_bar <- ggplot(bar_long,
+                aes(x = tissue, y = n, fill = category)) +
+  geom_col(position = position_dodge(width = 0.8),
+           width = 0.7, color = "white", linewidth = 0.3) +
+  geom_text(aes(label = bar_label),
+            position = position_dodge(width = 0.8),
+            vjust = -0.25, size = 2.3, lineheight = 0.85,
+            fontface = "bold") +
+  scale_fill_manual(values = BAR_COLORS) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.20))) +
+  labs(
+    title    = "miRNA target DEG coverage per tissue",
+    subtitle = paste0(
+      "3 bars per tissue: Total DEG | DB match (% of DEG) | Neg cosine pair (% of DB match)\n",
+      "miRNA clusters 1\u20135  (n = ", length(detected_miRNAs), " miRNAs)"
+    ),
+    x = NULL, y = "n DEGs", fill = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(color = "grey40", hjust = 0.5, size = 9),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    legend.position    = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+print(p_bar)
+ggsave(file.path(dir_out, "coverage_bar_grouped.svg"), p_bar, width = 10, height = 5)
+ggsave(file.path(dir_out, "coverage_bar_grouped.png"), p_bar, width = 10, height = 5, dpi = 300)
+cat("Saved: coverage_bar_grouped.svg / .png\n")
+```
+
+## 9b. Proportional grouped bar chart (% of Total DEG)
+
+```{r bar-grouped-pct, fig.height=5, fig.width=10}
+bar_long_pct <- bar_long %>%
+  left_join(stack_wide %>% dplyr::select(tissue, n_total),
+            by = "tissue") %>%
+  mutate(pct = n / n_total)
+
+p_bar_pct <- ggplot(bar_long_pct,
+                    aes(x = tissue, y = pct, fill = category)) +
+  geom_col(position = position_dodge(width = 0.8),
+           width = 0.7, color = "white", linewidth = 0.3) +
+  geom_text(aes(label = bar_label),
+            position = position_dodge(width = 0.8),
+            vjust = -0.25, size = 2.3, lineheight = 0.85,
+            fontface = "bold") +
+  scale_fill_manual(values = BAR_COLORS) +
+  scale_y_continuous(labels = scales::percent,
+                     limits = c(0, 1.25),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(
+    title    = "miRNA target DEG coverage per tissue (% of total DEG)",
+    subtitle = paste0(
+      "3 bars per tissue: Total DEG = 100% | DB match (% of DEG) | Neg cosine pair (% of DB match)\n",
+      "miRNA clusters 1\u20135  (n = ", length(detected_miRNAs), " miRNAs)"
+    ),
+    x = NULL, y = "% of total DEGs", fill = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(color = "grey40", hjust = 0.5, size = 9),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    legend.position    = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+print(p_bar_pct)
+ggsave(file.path(dir_out, "coverage_bar_grouped_pct.svg"), p_bar_pct, width = 10, height = 5)
+ggsave(file.path(dir_out, "coverage_bar_grouped_pct.png"), p_bar_pct, width = 10, height = 5, dpi = 300)
+cat("Saved: coverage_bar_grouped_pct.svg / .png\n")
+```
+
+# 10. Per-miRNA × tissue target count (Tier 3: neg cosine)
+
+## 10a. Compute n unique target DEGs per miRNA per tissue
+
+```{r per-mirna-count}
+mirna_tissue_n <- neg_union %>%
+  group_by(miRNA_Name, miRNA_cluster, tissue) %>%
+  summarise(n_targets = n_distinct(SYMBOL), .groups = "drop") %>%
+  mutate(
+    tissue      = factor(tissue, levels = TISSUE_ORDER),
+    miRNA_cluster = as.character(miRNA_cluster)
+  )
+
+# Complete: fill 0 for absent miRNA × tissue combinations
+mirna_tissue_n <- mirna_tissue_n %>%
+  complete(miRNA_Name, tissue = factor(TISSUE_ORDER, levels = TISSUE_ORDER),
+           fill = list(n_targets = 0)) %>%
+  group_by(miRNA_Name) %>%
+  fill(miRNA_cluster, .direction = "downup") %>%
+  ungroup()
+
+# Order miRNAs by total targets (descending)
+mirna_order <- mirna_tissue_n %>%
+  group_by(miRNA_Name) %>%
+  summarise(total = sum(n_targets), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  pull(miRNA_Name)
+
+mirna_tissue_n <- mirna_tissue_n %>%
+  mutate(miRNA_Name = factor(miRNA_Name, levels = mirna_order))
+
+cat("miRNA × tissue target counts (neg cosine, union basis):\n")
+mirna_tissue_n %>%
+  pivot_wider(names_from = tissue, values_from = n_targets, values_fill = 0) %>%
+  arrange(desc(rowSums(across(all_of(TISSUE_ORDER))))) %>%
+  as_tibble() %>%
+  print(n = Inf)
+
+write.csv(
+  mirna_tissue_n %>%
+    pivot_wider(names_from = tissue, values_from = n_targets, values_fill = 0),
+  file.path(dir_out, "per_miRNA_tissue_target_counts.csv"),
+  row.names = FALSE, quote = TRUE
+)
+cat("Saved: per_miRNA_tissue_target_counts.csv\n")
+```
+
+## 10b. Heatmap: miRNA × tissue, fill = n target DEGs
+
+```{r per-mirna-heatmap, fig.height=10, fig.width=7}
+p_heat <- ggplot(mirna_tissue_n,
+                 aes(x = tissue, y = miRNA_Name, fill = n_targets)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = ifelse(n_targets > 0, n_targets, "")),
+            size = 2.5, color = "grey20") +
+  scale_fill_gradient(low = "white", high = "#e6550d",
+                      name = "n target\nDEGs") +
+  labs(
+    title    = "miRNA target DEGs per tissue (Tier 3: cosine < \u22120.6)",
+    subtitle = "n = unique SYMBOL per miRNA × tissue; ordered by total targets",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(color = "grey40", hjust = 0.5, size = 9),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    axis.text.y     = element_text(size = 8),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+
+print(p_heat)
+ggsave(file.path(dir_out, "heatmap_miRNA_tissue_ntargets.svg"),
+       p_heat, width = 7, height = 10)
+ggsave(file.path(dir_out, "heatmap_miRNA_tissue_ntargets.png"),
+       p_heat, width = 7, height = 10, dpi = 300)
+cat("Saved: heatmap_miRNA_tissue_ntargets.svg / .png\n")
+```
+
+## 10c. Dot chart: total target DEGs per miRNA, colored by cluster
+
+```{r per-mirna-dot, fig.height=7, fig.width=6}
+mirna_total <- mirna_tissue_n %>%
+  group_by(miRNA_Name, miRNA_cluster) %>%
+  summarise(n_total = sum(n_targets),
+            n_tissue_active = sum(n_targets > 0),
+            .groups = "drop") %>%
+  arrange(n_total) %>%
+  mutate(miRNA_short = sub("^mmu-", "", miRNA_Name),
+         miRNA_short = factor(miRNA_short, levels = unique(miRNA_short)))
+
+p_dot <- ggplot(mirna_total,
+                aes(x = n_total, y = miRNA_short, color = miRNA_cluster)) +
+  geom_segment(aes(x = 0, xend = n_total, yend = miRNA_short),
+               color = "grey80", linewidth = 0.4) +
+  geom_point(aes(size = n_tissue_active), alpha = 0.85) +
+  geom_text(aes(label = n_total), hjust = -0.5, size = 2.8) +
+  scale_color_manual(name = "Cluster", values = CLUST_COLORS) +
+  scale_size_continuous(name = "n active\ntissues", range = c(2, 7)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Total DEG targets per miRNA (Tier 3: cosine < \u22120.6)",
+    subtitle = "Point size = number of tissues with \u22651 target DEG",
+    x = "Total unique target DEGs (across all tissues)", y = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(color = "grey40", hjust = 0.5, size = 9),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+print(p_dot)
+ggsave(file.path(dir_out, "dotchart_miRNA_total_targets.svg"),
+       p_dot, width = 6, height = 7)
+ggsave(file.path(dir_out, "dotchart_miRNA_total_targets.png"),
+       p_dot, width = 6, height = 7, dpi = 300)
+cat("Saved: dotchart_miRNA_total_targets.svg / .png\n")
+```
+
+# 11. Coverage summary table (formatted)
+
+```{r summary-table}
+summary_out <- coverage_tbl %>%
+  dplyr::select(tissue, n_DEG, n_any_target, n_neg_cosine, n_neg_cosine_strict,
+                pct_any_target, pct_neg_cosine, pct_neg_cosine_strict) %>%
+  mutate(
+    across(starts_with("pct_"), ~ scales::percent(.x, accuracy = 0.1))
+  ) %>%
+  dplyr::rename(
+    Tissue                 = tissue,
+    `n DEGs`               = n_DEG,
+    `n Tier1 (any)`        = n_any_target,
+    `n Tier3 (neg cosine)` = n_neg_cosine,
+    `n Tier3b (strict)`    = n_neg_cosine_strict,
+    `% Tier1`              = pct_any_target,
+    `% Tier3`              = pct_neg_cosine,
+    `% Tier3b`             = pct_neg_cosine_strict
+  )
+
+cat("Coverage summary:\n")
+summary_out %>% as_tibble() %>% print(n = Inf)
+```
+
+# 12. Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_out, "sessioninfo_02.4.txt")
+)
+sessionInfo()
+```

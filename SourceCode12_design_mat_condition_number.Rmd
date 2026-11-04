@@ -1,0 +1,135 @@
+---
+title: "Design matrix 2-norm condition number per tissue"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+```
+
+## Overview
+
+For each tissue, the maSigPro polynomial regression design matrix (`design_mat.csv`) is loaded
+from the latest dated subdirectory containing `maSigPro_rsq0.7_d3/` (exact name match).
+The 2-norm condition number is computed as κ₂ = σ_max / σ_min via `kappa(..., exact = TRUE)`.
+
+---
+
+## 1. Settings
+
+```{r settings}
+wd_mrna  <- "F:/wd/Mm_Bulk_RNA-seq"
+tissues  <- c("bat", "ewat", "gas", "gut", "hypo", "iwat", "liver", "panc", "sol")
+```
+
+---
+
+## 2. Find design_mat.csv (latest maSigPro_rsq0.7_d3)
+
+```{r find_csv}
+find_design_mat <- function(tis, wd_mrna) {
+  base  <- file.path(wd_mrna, "output", tis)
+  # Collect all design_mat.csv inside exact maSigPro_rsq0.7_d3 subdirectories
+  all_files <- list.files(base, pattern = "^design_mat\\.csv$",
+                          recursive = TRUE, full.names = TRUE)
+  # Keep only paths with exact directory name maSigPro_rsq0.7_d3
+  hits <- all_files[grepl("/maSigPro_rsq0\\.7_d3/", all_files)]
+  if (length(hits) == 0) return(NULL)
+  # Extract dates and return the path from the latest date
+  dates <- regmatches(hits, regexpr("\\d{4}-\\d{2}-\\d{2}", hits))
+  hits[which.max(as.Date(dates))]
+}
+
+paths_df <- tibble(tissue = tissues) %>%
+  mutate(path = map_chr(tissue, ~ {
+    p <- find_design_mat(.x, wd_mrna)
+    if (is.null(p)) NA_character_ else p
+  }))
+
+paths_df %>%
+  mutate(found = !is.na(path)) %>%
+  print(n = Inf)
+```
+
+---
+
+## 3. Compute 2-norm condition number
+
+```{r compute_kappa}
+compute_kappa <- function(path) {
+  if (is.na(path)) return(NA_real_)
+  X <- read.csv(path, row.names = 1)
+  X_mat <- as.matrix(X)
+  kappa(X_mat, exact = TRUE)
+}
+
+kappa_df <- paths_df %>%
+  mutate(
+    kappa2       = map_dbl(path, compute_kappa),
+    date         = regmatches(path, regexpr("\\d{4}-\\d{2}-\\d{2}", path)),
+    n_rows       = map_int(path, ~ if (is.na(.x)) NA_integer_ else nrow(read.csv(.x, row.names = 1))),
+    n_cols       = map_int(path, ~ if (is.na(.x)) NA_integer_ else ncol(read.csv(.x, row.names = 1)))
+  ) %>%
+  dplyr::select(tissue, date, n_rows, n_cols, kappa2)
+
+kappa_df %>% print(n = Inf)
+```
+
+---
+
+## 4. Summary
+
+```{r summary_table}
+summary_stats <- kappa_df %>%
+  filter(!is.na(kappa2)) %>%
+  summarise(
+    n        = n(),
+    mean     = mean(kappa2),
+    sd       = sd(kappa2),
+    min      = min(kappa2),
+    max      = max(kappa2)
+  )
+
+cat(sprintf(
+  "2-norm condition number (n = %d tissues)\n  mean ± SD : %.2f ± %.2f\n  range     : %.2f – %.2f\n",
+  summary_stats$n,
+  summary_stats$mean, summary_stats$sd,
+  summary_stats$min,  summary_stats$max
+))
+```
+
+---
+
+## 5. Per-tissue table
+
+```{r per_tissue_table}
+kappa_df %>%
+  arrange(kappa2) %>%
+  knitr::kable(digits = 2, caption = "2-norm condition number per tissue")
+```
+
+---
+
+## 6. Barplot
+
+```{r barplot, fig.width=7, fig.height=4}
+kappa_df %>%
+  filter(!is.na(kappa2)) %>%
+  mutate(tissue = fct_reorder(tissue, kappa2)) %>%
+  ggplot(aes(x = tissue, y = kappa2)) +
+  geom_col(fill = "steelblue", width = 0.6) +
+  geom_hline(yintercept = summary_stats$mean, linetype = "dashed", colour = "firebrick") +
+  labs(
+    title = "2-norm condition number of maSigPro design matrix",
+    subtitle = sprintf("Dashed line = mean (%.1f)", summary_stats$mean),
+    x = "Tissue", y = expression(kappa[2])
+  ) +
+  theme_bw(base_size = 13)
+
+ggsave(
+  file.path(wd_mrna, "output", "design_mat_condition_number_20260515.png"),
+  width = 7, height = 4, dpi = 150
+)
+```

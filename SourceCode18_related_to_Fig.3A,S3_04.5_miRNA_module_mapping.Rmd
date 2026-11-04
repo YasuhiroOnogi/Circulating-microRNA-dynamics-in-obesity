@@ -1,0 +1,558 @@
+---
+title: "miRNA–module mapping via cluster pathway enrichment"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.height = 8,
+  fig.width  = 12,
+  dpi        = 150
+)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+
+tissues <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+MIRNA_PAIRS_CSV <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs/output/02_integration/2026-04-27/union/negative_cosine_pairs_union.csv"
+
+# Significance threshold for pathway enrichment (cluster-level)
+PADJ_THRESHOLD <- 0.05
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd_mirna, "output", "04.5_mirna_module_mapping", date_str)
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("Output:", dir_output, "\n")
+
+tissue_pal <- setNames(
+  colorRampPalette(brewer.pal(9, "Set1"))(length(tissues)),
+  tissues
+)
+
+# miRNA cluster colors — identical to 03_miRNA_mRNA_circus_20260421.Rmd
+cluster_colors <- c(
+  "1" = "#B3E2CD",
+  "2" = "#FDCDAC",
+  "3" = "#CBD5E8",
+  "4" = "#F4CAE4",
+  "5" = "#FFF2AE"
+)
+```
+
+# 3. Load miRNA–cluster mapping from cosine pairs
+
+Each miRNA belongs to one cluster per tissue.
+
+```{r load_mirna_clusters}
+if (!file.exists(MIRNA_PAIRS_CSV))
+  stop("miRNA pairs file not found: ", MIRNA_PAIRS_CSV)
+
+cosine_pairs <- read.csv(MIRNA_PAIRS_CSV, stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  mutate(miRNA_cluster = as.character(miRNA_cluster))
+
+# Unique (tissue, miRNA_cluster, miRNA_Name) — one miRNA per cluster per tissue
+mirna_cluster_map <- cosine_pairs %>%
+  distinct(tissue, miRNA_cluster, miRNA_Name) %>%
+  arrange(tissue, miRNA_cluster, miRNA_Name)
+
+cat("miRNA-cluster entries:", nrow(mirna_cluster_map), "\n")
+mirna_cluster_map %>%
+  count(tissue, miRNA_cluster, name = "n_miRNAs") %>%
+  arrange(tissue, miRNA_cluster) %>%
+  print(n = Inf)
+```
+
+# 4. Load pathway enrichment per cluster from 04_GO_KEGG
+
+```{r load_pathways}
+find_latest_dated_dir <- function(base) {
+  dirs  <- list.dirs(base, full.names = TRUE, recursive = FALSE)
+  dated <- sort(dirs[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(dirs))],
+                decreasing = TRUE)
+  if (length(dated) == 0) stop("No dated subdirectory under: ", base)
+  cat("Using:", dated[1], "\n")
+  dated[1]
+}
+
+safe_read <- function(path) {
+  if (!file.exists(path)) { cat("Not found — skipped:", basename(path), "\n"); return(NULL) }
+  df <- read.csv(path, stringsAsFactors = FALSE) %>% as_tibble()
+  cat("Loaded", nrow(df), "rows:", basename(path), "\n")
+  df
+}
+
+dir_04   <- find_latest_dated_dir(file.path(wd_mirna, "output", "04_GO_KEGG"))
+
+go_bp    <- safe_read(file.path(dir_04, "GO",      "GO_BP_tissue_cluster_all.csv"))
+kegg     <- safe_read(file.path(dir_04, "KEGG",    "KEGG_tissue_cluster_all.csv"))
+msigdb   <- safe_read(file.path(dir_04, "MSigDB",  "MSigDB_tissue_cluster_all.csv"))
+reactome <- safe_read(file.path(dir_04, "Reactome","Reactome_tissue_cluster_all.csv"))
+```
+
+```{r combine_pathways}
+# Standardise to: tissue, miRNA_cluster, source, pathway_id, Description, p.adjust
+add_source <- function(df, src) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  df %>%
+    mutate(miRNA_cluster = as.character(miRNA_cluster),
+           source        = src) %>%
+    dplyr::select(tissue, miRNA_cluster, source,
+                  pathway_id = ID, Description, p.adjust)
+}
+
+msigdb_rows <- if (!is.null(msigdb) && nrow(msigdb) > 0) {
+  bind_rows(lapply(unique(msigdb$msigdb_set), function(s) {
+    add_source(
+      msigdb %>% filter(msigdb_set == s),
+      paste0("MSigDB:", s)
+    )
+  }))
+} else NULL
+
+cluster_pathways <- bind_rows(
+  add_source(go_bp,    "GO BP"),
+  add_source(kegg,     "KEGG"),
+  add_source(reactome, "Reactome"),
+  msigdb_rows
+) %>%
+  filter(p.adjust <= PADJ_THRESHOLD)
+
+cat("\nSignificant pathway-cluster entries (p.adjust <=", PADJ_THRESHOLD, "):",
+    nrow(cluster_pathways), "\n")
+cat("Sources:", paste(sort(unique(cluster_pathways$source)), collapse = ", "), "\n")
+cat("Tissues:", paste(sort(unique(cluster_pathways$tissue)), collapse = ", "), "\n")
+```
+
+# 5. Load module membership from 04.3
+
+```{r load_modules}
+dir_04_3    <- find_latest_dated_dir(file.path(wd_mirna, "output", "04.3_pathway_network"))
+modules_csv <- file.path(dir_04_3, "pathway_modules_all_tissues.csv")
+
+if (!file.exists(modules_csv))
+  stop("pathway_modules_all_tissues.csv not found — run 04.3 first.")
+
+# node_id format: "source_db|pathway_id"  e.g. "GO BP|GO:0042552"
+module_membership <- read.csv(modules_csv, stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  mutate(
+    module     = as.character(module),
+    source_db  = sub("\\|.*$",    "", node_id),
+    pathway_id = sub("^[^|]+\\|", "", node_id),
+    module_id  = paste0(tissue, "_mod", module)
+  ) %>%
+  dplyr::select(tissue, source_db, pathway_id, module, module_id, Description)
+
+cat("Module membership entries:", nrow(module_membership), "\n")
+cat("Tissues:", paste(sort(unique(module_membership$tissue)), collapse = ", "), "\n")
+```
+
+# 6. Join: cluster-enriched pathways → module
+
+```{r join_cluster_module}
+# Join on tissue + source + pathway_id
+cluster_module <- cluster_pathways %>%
+  inner_join(
+    module_membership %>%
+      dplyr::select(tissue, source = source_db, pathway_id, module, module_id),
+    by = c("tissue", "source", "pathway_id")
+  )
+
+cat("Pathway-cluster entries with module assignment:",
+    nrow(cluster_module), "\n")
+
+# Aggregate: per (tissue, miRNA_cluster, module) — count shared pathways
+cluster_module_agg <- cluster_module %>%
+  group_by(tissue, miRNA_cluster, module, module_id) %>%
+  summarise(
+    n_pathways     = n_distinct(pathway_id),
+    top_pathways   = paste(head(Description, 3), collapse = "; "),
+    min_p_adj      = min(p.adjust),
+    .groups        = "drop"
+  ) %>%
+  arrange(tissue, module, miRNA_cluster)
+
+cat("Cluster-module pairs:", nrow(cluster_module_agg), "\n\n")
+cluster_module_agg %>% print(n = 30)
+```
+
+# 7. Map miRNAs to modules
+
+Join cluster-module aggregation with individual miRNA names.
+
+```{r mirna_module_table}
+mirna_module_tbl <- cluster_module_agg %>%
+  inner_join(mirna_cluster_map, by = c("tissue", "miRNA_cluster")) %>%
+  arrange(tissue, module, miRNA_cluster, miRNA_Name)
+
+cat("miRNA-module entries:", nrow(mirna_module_tbl), "\n\n")
+
+# Summary: per (tissue, module) → distinct miRNAs
+module_mirna_summary <- mirna_module_tbl %>%
+  group_by(tissue, module, module_id) %>%
+  summarise(
+    n_clusters    = n_distinct(miRNA_cluster),
+    n_miRNAs      = n_distinct(miRNA_Name),
+    miRNA_list    = paste(sort(unique(miRNA_Name)), collapse = ", "),
+    cluster_list  = paste(sort(unique(miRNA_cluster)), collapse = ", "),
+    n_pathways_total = sum(n_pathways),
+    .groups       = "drop"
+  ) %>%
+  arrange(tissue, as.integer(module))
+
+cat("=== Module–miRNA summary ===\n")
+module_mirna_summary %>% print(n = Inf)
+
+write.csv(mirna_module_tbl,
+          file.path(dir_output, "mirna_module_full.csv"),
+          row.names = FALSE)
+write.csv(module_mirna_summary,
+          file.path(dir_output, "module_mirna_summary.csv"),
+          row.names = FALSE)
+cat("\nSaved: mirna_module_full.csv, module_mirna_summary.csv\n")
+```
+
+# 8. Pathway detail: top pathways linking each cluster to its module
+
+```{r pathway_detail}
+pathway_detail <- cluster_module %>%
+  inner_join(
+    mirna_cluster_map %>%
+      group_by(tissue, miRNA_cluster) %>%
+      summarise(miRNA_list = paste(sort(unique(miRNA_Name)), collapse = ", "),
+                .groups = "drop"),
+    by = c("tissue", "miRNA_cluster")
+  ) %>%
+  arrange(tissue, module, miRNA_cluster, p.adjust) %>%
+  dplyr::select(tissue, module_id, miRNA_cluster, miRNA_list,
+                source, pathway_id, Description, p.adjust)
+
+cat("=== Top 3 linking pathways per (tissue, module, cluster) ===\n")
+pathway_detail %>%
+  group_by(tissue, module_id, miRNA_cluster) %>%
+  slice_min(p.adjust, n = 3, with_ties = FALSE) %>%
+  ungroup() %>%
+  print(n = Inf)
+
+write.csv(pathway_detail,
+          file.path(dir_output, "pathway_detail.csv"),
+          row.names = FALSE)
+cat("Saved: pathway_detail.csv\n")
+```
+
+# 9. Visualization
+
+## 9a. Combined heatmap: miRNA cluster (rows) × module (columns, split by tissue)
+
+```{r heatmap_combined, fig.height=5, fig.width=16}
+# Column order: modules sorted by tissue order then module number
+mod_col_order <- cluster_module_agg %>%
+  distinct(tissue, module, module_id) %>%
+  mutate(tissue = factor(tissue, levels = tissues)) %>%
+  arrange(tissue, as.integer(module)) %>%
+  pull(module_id)
+
+# Row order: cluster numbers in fixed order
+clu_row_order <- as.character(sort(as.integer(names(cluster_colors))))
+
+# Build complete matrix (all cluster × module combinations, fill 0)
+mat_all <- cluster_module_agg %>%
+  dplyr::select(miRNA_cluster, module_id, n_pathways) %>%
+  tidyr::complete(miRNA_cluster = clu_row_order,
+                  module_id     = mod_col_order,
+                  fill          = list(n_pathways = 0L)) %>%
+  pivot_wider(names_from = module_id, values_from = n_pathways, values_fill = 0L) %>%
+  column_to_rownames("miRNA_cluster") %>%
+  as.matrix()
+
+mat_all <- mat_all[clu_row_order, mod_col_order, drop = FALSE]
+
+# Column split by tissue
+col_split <- factor(sub("_mod.*$", "", colnames(mat_all)), levels = tissues)
+
+# Row annotation: cluster color bar on the left
+row_cols <- cluster_colors[rownames(mat_all)]
+row_anno <- rowAnnotation(
+  cluster = anno_simple(
+    rownames(mat_all),
+    col   = row_cols,
+    width = unit(5, "mm")
+  ),
+  annotation_name_side = "top",
+  annotation_name_gp   = gpar(fontsize = 9),
+  show_legend          = FALSE
+)
+
+# log1p transform for color mapping: spreads sparse non-zero values apart
+# Colors mirror the white→red positive half of 04.4 target score heatmap
+# Fixed upper limit at 100 so the color scale is comparable across runs
+mat_log <- log1p(mat_all)
+max_log <- log1p(100)
+col_fn  <- colorRamp2(c(0, max_log / 2, max_log),
+                      c("#F0F0F0", "#FC8D59", "#D73027"))
+
+ht_all <- Heatmap(
+  mat_log,
+  name              = "n pathways\n(log1p)",
+  col               = col_fn,
+  na_col            = "grey90",
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  column_split      = col_split,
+  column_gap        = unit(4, "mm"),
+  border_gp         = gpar(col = "grey30", lwd = 1.2),
+  rect_gp           = gpar(col = "white",  lwd = 0.4),
+  left_annotation   = row_anno,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    v <- mat_all[i, j]   # show original integer count
+    if (v > 0)
+      grid.text(v, x, y,
+                gp = gpar(fontsize = 8,
+                           col = ifelse(mat_log[i, j] > max_log * 0.6,
+                                        "white", "grey20")))
+  },
+  row_names_gp      = gpar(fontsize = 10),
+  column_names_gp   = gpar(fontsize = 8),
+  column_names_rot  = 45,
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  row_title         = NULL,
+  heatmap_legend_param = list(title_position = "leftcenter-rot",
+                               at     = log1p(c(0, 1, 5, 10, 25, 50, 100)),
+                               labels = c("0", "1", "5", "10", "25", "50", "100"))
+)
+
+lgd_cluster <- Legend(
+  labels    = names(row_cols),
+  legend_gp = gpar(fill = row_cols),
+  title     = "miRNA cluster",
+  title_gp  = gpar(fontsize = 9, fontface = "bold"),
+  labels_gp = gpar(fontsize = 8)
+)
+
+draw(ht_all, annotation_legend_list = list(lgd_cluster))
+
+n_cols <- ncol(mat_all)
+png(file.path(dir_output, "heatmap_all_tissues.png"),
+    width  = max(1600, n_cols * 60 + 400),
+    height = 700, res = 150)
+draw(ht_all, annotation_legend_list = list(lgd_cluster))
+dev.off()
+
+svg(file.path(dir_output, "heatmap_all_tissues.svg"),
+    width  = max(12, n_cols * 0.4 + 4),
+    height = 5)
+draw(ht_all, annotation_legend_list = list(lgd_cluster))
+dev.off()
+
+cat("Saved: heatmap_all_tissues.png / .svg\n")
+```
+
+## 9b. Per-tissue bubble chart: module × miRNA (individual level)
+
+```{r bubble_per_tissue, results="asis", fig.height=7, fig.width=11}
+for (tis in tissues) {
+  df_tis <- mirna_module_tbl %>% filter(tissue == tis)
+  if (nrow(df_tis) == 0) {
+    cat("\n\n###", tis, "\n\nNo data.\n\n"); next
+  }
+  cat("\n\n###", tis, "\n\n")
+
+  mod_lvls <- paste0(tis, "_mod",
+                     sort(as.integer(unique(df_tis$module))))
+
+  # Row order: cluster ascending, then alphabetically within cluster
+  mir_lvls <- df_tis %>%
+    distinct(miRNA_Name, miRNA_cluster) %>%
+    mutate(miRNA_cluster = as.integer(miRNA_cluster)) %>%
+    arrange(miRNA_cluster, miRNA_Name) %>%
+    pull(miRNA_Name)
+
+  df_plot <- df_tis %>%
+    mutate(module_id     = factor(module_id, levels = mod_lvls),
+           miRNA_cluster = factor(miRNA_cluster, levels = names(cluster_colors)),
+           label         = sub("^mmu-", "", miRNA_Name),
+           label         = factor(label, levels = rev(sub("^mmu-", "", mir_lvls))))
+
+  p <- ggplot(df_plot, aes(x = module_id, y = label)) +
+    geom_point(aes(size = n_pathways, fill = miRNA_cluster),
+               shape = 21, color = "grey30", alpha = 0.85) +
+    scale_size_continuous(range = c(2, 10), name = "n shared\npathways") +
+    scale_fill_manual(values = cluster_colors, drop = FALSE,
+                      name = "miRNA\ncluster") +
+    labs(
+      title    = paste0(tis, " — miRNA × module"),
+      subtitle = paste0(n_distinct(df_plot$label), " miRNAs  ×  ",
+                        n_distinct(df_plot$module_id), " modules"),
+      x = "Module", y = "miRNA"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      axis.text.x      = element_text(angle = 45, hjust = 1),
+      panel.grid.major = element_line(color = "grey92")
+    )
+
+  print(p)
+
+  w <- max(5, n_distinct(df_plot$module_id)  * 0.9 + 3)
+  h <- max(4, n_distinct(df_plot$miRNA_Name) * 0.28 + 2)
+  ggsave(file.path(dir_output, paste0("bubble_", tis, ".png")),
+         p, width = w, height = h, dpi = 150)
+  ggsave(file.path(dir_output, paste0("bubble_", tis, ".svg")),
+         p, width = w, height = h)
+  cat("Saved: bubble_", tis, ".png / .svg\n\n", sep = "")
+}
+```
+
+## 9c. Combined bubble chart: miRNA (rows) × all tissues (columns, left → right)
+
+```{r bubble_combined}
+tissue_order_combined <- c("hypo", "liver", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+df_comb <- mirna_module_tbl %>%
+  filter(tissue %in% tissue_order_combined) %>%
+  mutate(tissue = factor(tissue, levels = tissue_order_combined))
+
+# Module factor levels: ordered by tissue_order_combined, then module number within tissue
+module_lvls_comb <- df_comb %>%
+  distinct(tissue, module, module_id) %>%
+  mutate(module_int = as.integer(module)) %>%
+  arrange(tissue, module_int) %>%
+  pull(module_id)
+
+# Global miRNA row order: lowest cluster number across tissues, then alphabetically
+mir_order_comb <- df_comb %>%
+  distinct(miRNA_Name, miRNA_cluster) %>%
+  group_by(miRNA_Name) %>%
+  slice_min(as.integer(miRNA_cluster), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(as.integer(miRNA_cluster), miRNA_Name) %>%
+  pull(miRNA_Name)
+
+# Short label (strip "mmu-" prefix); factor levels reversed so top of plot = cluster 1
+label_comb <- sub("^mmu-", "", mir_order_comb)
+
+df_comb <- df_comb %>%
+  mutate(
+    module_id     = factor(module_id, levels = module_lvls_comb),
+    miRNA_cluster = factor(miRNA_cluster, levels = names(cluster_colors)),
+    label         = factor(sub("^mmu-", "", miRNA_Name),
+                           levels = rev(label_comb))
+  )
+
+n_mir_comb <- n_distinct(df_comb$miRNA_Name)
+n_mod_comb <- n_distinct(df_comb$module_id)
+
+# Base plot (no theme — shared between screen and print)
+p_bubble_base <- ggplot(df_comb, aes(x = module_id, y = label)) +
+  geom_point(aes(size = n_pathways, fill = miRNA_cluster),
+             shape = 21, color = "grey30", alpha = 0.85) +
+  scale_size_continuous(range = c(4, 20), name = "n shared\npathways") +
+  scale_fill_manual(values = cluster_colors, drop = FALSE,
+                    name = "miRNA\ncluster") +
+  scale_x_discrete(labels = function(x) sub("^[^_]+_mod", "", x)) +
+  facet_grid(. ~ tissue, scales = "free_x", space = "free_x") +
+  labs(
+    title    = "Combined miRNA × module bubble plot",
+    subtitle = paste("Tissues:", paste(tissue_order_combined, collapse = " | ")),
+    x        = "Module",
+    y        = "miRNA"
+  )
+
+# Screen theme: 12pt, 0.28 inch/row
+theme_screen <- theme_bw(base_size = 12) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y      = element_text(size = 12),
+    panel.grid.major = element_line(color = "grey92"),
+    strip.text       = element_text(face = "bold", size = 12)
+  )
+
+# Print theme: 42pt (= 8pt × 945/180), 0.14 inch/row × scale_factor
+scale_factor <- 945 / 180
+theme_print <- theme_bw(base_size = 42) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 42),
+    axis.text.y      = element_text(size = 42),
+    panel.grid.major = element_line(color = "grey92"),
+    strip.text       = element_text(face = "bold", size = 42)
+  )
+
+# HTML display
+print(p_bubble_base + theme_screen)
+
+# Save with print theme
+p_bubble_print <- p_bubble_base + theme_print
+w_comb  <- max(16, n_mod_comb * 0.7 + 5)
+h_screen <- max(5, n_mir_comb * 0.28 + 2.5)
+h_print  <- max(5, n_mir_comb * 0.14 + 2.5) * scale_factor
+
+ggsave(file.path(dir_output, "bubble_combined.png"),
+       p_bubble_print, width = w_comb, height = h_print, dpi = 150,
+       limitsize = FALSE)
+ggsave(file.path(dir_output, "bubble_combined.svg"),
+       p_bubble_print, width = w_comb, height = h_print,
+       limitsize = FALSE)
+cat("Saved: bubble_combined.png / .svg\n")
+```
+
+## 9d. Summary barplot: miRNAs per module across all tissues
+
+```{r summary_barplot, fig.height=8, fig.width=13}
+bar_df <- module_mirna_summary %>%
+  filter(!is.na(module_id)) %>%
+  mutate(module_id = factor(module_id,
+                            levels = module_id[order(tissue, as.integer(module))]))
+
+p_bar <- ggplot(bar_df, aes(x = n_miRNAs, y = module_id, fill = tissue)) +
+  geom_col() +
+  geom_text(aes(label = n_miRNAs), hjust = -0.2, size = 3) +
+  scale_fill_manual(values = tissue_pal) +
+  facet_wrap(~ tissue, scales = "free_y", ncol = 3) +
+  labs(x = "Number of miRNAs linked to module",
+       y = NULL,
+       title = "miRNAs per tissue-module (via cluster pathway enrichment)") +
+  theme_bw(base_size = 9) +
+  theme(strip.text      = element_text(face = "bold"),
+        legend.position = "none")
+
+print(p_bar)
+
+ggsave(file.path(dir_output, "summary_mirnas_per_module.png"),
+       p_bar, width = 13, height = 8, dpi = 150)
+ggsave(file.path(dir_output, "summary_mirnas_per_module.svg"),
+       p_bar, width = 13, height = 8)
+cat("Saved: summary_mirnas_per_module.png / .svg\n")
+```
+
+# Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

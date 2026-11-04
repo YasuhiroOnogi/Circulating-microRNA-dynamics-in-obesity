@@ -1,0 +1,411 @@
+---
+title: "04.6.1 Integrated module view: logistic-filtered (04.4.3) + miRNA cluster mapping"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.height = 8,
+  fig.width  = 18,
+  dpi        = 150
+)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+
+tissues <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+
+# miRNA cluster colors — identical to 03_miRNA_mRNA_circus_20260421.Rmd
+cluster_colors <- c(
+  "1" = "#B3E2CD",
+  "2" = "#FDCDAC",
+  "3" = "#CBD5E8",
+  "4" = "#F4CAE4",
+  "5" = "#FFF2AE"
+)
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd_mirna, "output", "04.6.1_integrated_module_view", date_str)
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("Output:", dir_output, "\n")
+```
+
+# 3. Load data
+
+```{r helpers}
+find_latest_dated_dir <- function(base) {
+  dirs  <- list.dirs(base, full.names = TRUE, recursive = FALSE)
+  dated <- sort(dirs[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(dirs))],
+                decreasing = TRUE)
+  if (length(dated) == 0) stop("No dated subdirectory under: ", base)
+  cat("Using:", dated[1], "\n")
+  dated[1]
+}
+```
+
+## 3a. Logistic regression results from 04.4.3
+
+```{r load_logistic}
+dir_04_4_3  <- find_latest_dated_dir(file.path(wd_mirna, "output", "04.4.3_module_activity"))
+logistic_df <- read.csv(file.path(dir_04_4_3, "logistic_enrichment.csv"),
+                        stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  mutate(module = as.character(module))
+
+cat("Logistic results:", nrow(logistic_df), "tissue-modules\n")
+cat("Significant (OR>1, p_adj<0.05):",
+    sum(logistic_df$OR > 1 & logistic_df$p_adj < 0.05, na.rm = TRUE), "\n")
+```
+
+## 3b. miRNA cluster–module mapping from 04.5
+
+```{r load_mirna_module}
+dir_04_5     <- find_latest_dated_dir(file.path(wd_mirna, "output", "04.5_mirna_module_mapping"))
+mirna_mod_df <- read.csv(file.path(dir_04_5, "mirna_module_full.csv"),
+                         stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  mutate(miRNA_cluster = as.character(miRNA_cluster),
+         module        = as.character(module))
+
+# Reconstruct cluster × module aggregation (one row per tissue × cluster × module)
+cluster_module_agg <- mirna_mod_df %>%
+  distinct(tissue, miRNA_cluster, module, module_id, n_pathways)
+
+cat("miRNA cluster-module pairs:", nrow(cluster_module_agg), "\n")
+```
+
+# 4. Build shared column order
+
+Use the union of module_ids from both datasets, ordered by tissue then module number.
+
+```{r col_order}
+all_mods <- bind_rows(
+  logistic_df        %>% distinct(tissue, module, module_id) %>% mutate(module = as.character(module)),
+  cluster_module_agg %>% distinct(tissue, module, module_id) %>% mutate(module = as.character(module))
+) %>%
+  distinct(tissue, module, module_id) %>%
+  mutate(tissue = factor(tissue, levels = tissues)) %>%
+  arrange(tissue, as.integer(module))
+
+col_order  <- all_mods$module_id
+col_split  <- factor(sub("_mod.*$", "", col_order), levels = tissues)
+
+cat("Total columns (module_ids):", length(col_order), "\n")
+```
+
+# 5. Build matrices
+
+## 5a. Logistic regression vector (log2OR per module_id)
+
+```{r logistic_vec}
+log2or_vec    <- setNames(rep(NA_real_, length(col_order)), col_order)
+log2ci_lo_vec <- setNames(rep(NA_real_, length(col_order)), col_order)
+log2ci_hi_vec <- setNames(rep(NA_real_, length(col_order)), col_order)
+p_adj_vec     <- setNames(rep(NA_real_, length(col_order)), col_order)
+or_vec        <- setNames(rep(NA_real_, length(col_order)), col_order)
+
+for (mid in intersect(col_order, logistic_df$module_id)) {
+  r <- logistic_df[logistic_df$module_id == mid, ][1, ]
+  log2or_vec[mid]    <- r$log2OR
+  log2ci_lo_vec[mid] <- log2(pmax(r$CI_lo, 1e-6))
+  log2ci_hi_vec[mid] <- log2(pmax(r$CI_hi, 1e-6))
+  p_adj_vec[mid]     <- r$p_adj
+  or_vec[mid]        <- r$OR
+}
+
+sig_enriched <- !is.na(p_adj_vec) & p_adj_vec < 0.05 & or_vec > 1
+sig_depleted <- !is.na(p_adj_vec) & p_adj_vec < 0.05 & or_vec < 1
+
+pt_col <- ifelse(sig_enriched, "#D73027",
+          ifelse(sig_depleted, "#4575B4", "grey60"))
+pt_col[is.na(log2or_vec)] <- NA_character_
+
+cat("Modules with logistic data:", sum(!is.na(log2or_vec)), "/", length(col_order), "\n")
+cat("Significant enriched (OR>1, p_adj<0.05):", sum(sig_enriched), "\n")
+cat("Significant depleted (OR<1, p_adj<0.05):", sum(sig_depleted), "\n")
+
+# y-axis range for forest plot (pad 15%)
+finite_ci <- c(log2ci_lo_vec, log2ci_hi_vec, log2or_vec)
+finite_ci <- finite_ci[is.finite(finite_ci)]
+ypad          <- diff(range(finite_ci)) * 0.15
+ylim_forest   <- range(finite_ci) + c(-ypad, ypad)
+if (diff(ylim_forest) < 0.5) ylim_forest <- c(-1, 1)
+```
+
+## 5b. miRNA cluster × module matrix
+
+```{r cluster_mat}
+clu_row_order <- as.character(sort(as.integer(names(cluster_colors))))
+
+mat_all <- cluster_module_agg %>%
+  dplyr::select(miRNA_cluster, module_id, n_pathways) %>%
+  tidyr::complete(miRNA_cluster = clu_row_order,
+                  module_id     = col_order,
+                  fill          = list(n_pathways = 0L)) %>%
+  pivot_wider(names_from = module_id, values_from = n_pathways, values_fill = 0L) %>%
+  column_to_rownames("miRNA_cluster") %>%
+  as.matrix()
+
+mat_all <- mat_all[clu_row_order, col_order, drop = FALSE]
+
+mat_log <- log1p(mat_all)
+max_log <- max(mat_log, na.rm = TRUE)
+
+cat("Heatmap matrix:", nrow(mat_all), "rows ×", ncol(mat_all), "columns\n")
+```
+
+# 6. Combined heatmap
+
+```{r combined_heatmap, fig.height=8, fig.width=18}
+# ── Top annotation: forest plot (log2OR + 95% CI) ───────────────────────────
+# Positional (unnamed) vectors — indexed by column position within col_order
+or_pos    <- unname(log2or_vec)
+ci_lo_pos <- unname(log2ci_lo_vec)
+ci_hi_pos <- unname(log2ci_hi_vec)
+col_pos   <- unname(pt_col)
+
+total_n_cols <- length(or_pos)
+
+forest_fn <- AnnotationFunction(
+  fun = function(index) {
+    n        <- length(index)
+    lo       <- ylim_forest[1]
+    hi       <- ylim_forest[2]
+    is_first <- index[1] == 1
+
+    pushViewport(viewport(xscale = c(0.5, n + 0.5), yscale = c(lo, hi),
+                          clip = "off"))
+
+    # Dashed reference line at log2OR = 0
+    grid.lines(unit(c(0.5, n + 0.5), "native"), unit(c(0, 0), "native"),
+               gp = gpar(col = "grey50", lty = "dashed", lwd = 0.8))
+
+    hw <- 0.22   # whisker half-width in native x units
+
+    for (k in seq_along(index)) {
+      i   <- index[k]
+      col <- col_pos[i]
+      if (is.na(or_pos[i]) || is.na(col)) next
+
+      # CI segment + end caps
+      lo_i <- ci_lo_pos[i]; hi_i <- ci_hi_pos[i]
+      if (!is.na(lo_i) && !is.na(hi_i)) {
+        grid.segments(unit(k, "native"), unit(lo_i, "native"),
+                      unit(k, "native"), unit(hi_i, "native"),
+                      gp = gpar(col = col, lwd = 1.4))
+        for (yy in c(lo_i, hi_i)) {
+          grid.segments(unit(k - hw, "native"), unit(yy, "native"),
+                        unit(k + hw, "native"), unit(yy, "native"),
+                        gp = gpar(col = col, lwd = 1.4))
+        }
+      }
+
+      # Central point
+      grid.points(unit(k, "native"), unit(or_pos[i], "native"),
+                  pch = 16, size = unit(1.8, "mm"),
+                  gp  = gpar(col = col))
+    }
+
+    # ── Border: surround each tissue split ───────────────────────────────────
+    grid.rect(gp = gpar(col = "grey30", fill = NA, lwd = 1.2))
+
+    # ── Y-axis: leftmost split only ───────────────────────────────────────────
+    if (is_first) {
+      y_at <- pretty(c(lo, hi), n = 5)
+      y_at <- y_at[y_at >= lo & y_at <= hi]
+      grid.yaxis(at    = y_at,
+                 label = as.character(round(y_at, 1)),
+                 main  = TRUE,
+                 gp    = gpar(fontsize = 7))
+      grid.text("log2OR",
+                x   = unit(-3.5, "lines"),
+                y   = unit(0.5, "npc"),
+                rot = 90,
+                gp  = gpar(fontsize = 8))
+    }
+
+    upViewport()
+  },
+  which = "column",
+  n     = total_n_cols
+)
+
+top_anno <- HeatmapAnnotation(
+  log2OR = forest_fn,
+  annotation_name_gp   = gpar(fontsize = 8),
+  annotation_name_side = "left",
+  height               = unit(4, "cm")
+)
+
+# ── Left annotation: cluster color bar ──────────────────────────────────────
+row_cols <- cluster_colors[rownames(mat_all)]
+row_anno <- rowAnnotation(
+  cluster = anno_simple(
+    rownames(mat_all),
+    col   = row_cols,
+    width = unit(5, "mm")
+  ),
+  annotation_name_side = "top",
+  annotation_name_gp   = gpar(fontsize = 9),
+  show_legend          = FALSE
+)
+
+# ── Heatmap body: miRNA cluster × module (log1p n_pathways) ─────────────────
+col_fn <- colorRamp2(c(0, max_log / 2, max_log),
+                     c("#F0F0F0", "#FC8D59", "#D73027"))
+
+cell_size <- unit(7, "mm")   # square cell side length
+
+ht <- Heatmap(
+  mat_log,
+  name              = "n pathways\n(log1p)",
+  col               = col_fn,
+  na_col            = "grey90",
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  column_split      = col_split,
+  column_gap        = unit(4, "mm"),
+  border_gp         = gpar(col = "grey30", lwd = 1.2),
+  rect_gp           = gpar(col = "white",  lwd = 0.4),
+  top_annotation    = top_anno,
+  left_annotation   = row_anno,
+  width             = cell_size * ncol(mat_log),
+  height            = cell_size * nrow(mat_log),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    v <- mat_all[i, j]
+    if (v > 0)
+      grid.text(v, x, y,
+                gp = gpar(fontsize = 7,
+                           col = ifelse(mat_log[i, j] > max_log * 0.6,
+                                        "white", "grey20")))
+  },
+  row_names_gp      = gpar(fontsize = 10),
+  column_names_gp   = gpar(fontsize = 8),
+  column_names_rot  = 45,
+  column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+  row_title         = NULL,
+  heatmap_legend_param = list(
+    title_position = "leftcenter-rot",
+    at             = log1p(c(0, 1, 2, 5, 10)),
+    labels         = c("0", "1", "2", "5", "10")
+  )
+)
+
+# ── Legends ──────────────────────────────────────────────────────────────────
+lgd_cluster <- Legend(
+  labels    = names(row_cols),
+  legend_gp = gpar(fill = row_cols),
+  title     = "miRNA cluster",
+  title_gp  = gpar(fontsize = 9, fontface = "bold"),
+  labels_gp = gpar(fontsize = 8)
+)
+
+lgd_logistic <- Legend(
+  labels    = c("Enriched (OR>1, p_adj<0.05)", "Depleted (OR<1, p_adj<0.05)", "n.s. / no data"),
+  legend_gp = gpar(col = c("#D73027", "#4575B4", "grey60")),
+  title     = "miRNA target enrichment",
+  title_gp  = gpar(fontsize = 9, fontface = "bold"),
+  labels_gp = gpar(fontsize = 8),
+  type      = "points",
+  pch       = 16
+)
+
+draw(ht,
+     annotation_legend_list = list(lgd_cluster, lgd_logistic),
+     merge_legend            = FALSE)
+
+# ── Save ─────────────────────────────────────────────────────────────────────
+n_cols <- ncol(mat_all)
+w_in   <- max(14, n_cols * 0.38 + 5)
+
+png(file.path(dir_output, "integrated_module_view.png"),
+    width = max(2400, n_cols * 58 + 600), height = 1400, res = 150)
+draw(ht,
+     annotation_legend_list = list(lgd_cluster, lgd_logistic),
+     merge_legend            = FALSE)
+dev.off()
+
+svg(file.path(dir_output, "integrated_module_view.svg"),
+    width = w_in, height = 9)
+draw(ht,
+     annotation_legend_list = list(lgd_cluster, lgd_logistic),
+     merge_legend            = FALSE)
+dev.off()
+
+cat("Saved: integrated_module_view.png / .svg\n")
+```
+
+# 7. Summary table
+
+Modules that are both significantly enriched for miRNA targets (04.4.3)
+and linked to at least one miRNA cluster via pathway enrichment (04.5).
+
+```{r summary_table}
+logistic_sig <- logistic_df %>%
+  filter(OR > 1, p_adj < 0.05) %>%
+  dplyr::select(tissue, module, module_id, OR, log2OR, CI_lo, CI_hi, p_adj)
+
+cluster_coverage <- cluster_module_agg %>%
+  group_by(tissue, module, module_id) %>%
+  summarise(
+    n_clusters        = n_distinct(miRNA_cluster),
+    cluster_list      = paste(sort(unique(miRNA_cluster)), collapse = ", "),
+    total_n_pathways  = sum(n_pathways),
+    .groups           = "drop"
+  )
+
+# Join miRNA names per module_id
+mirna_per_mod <- mirna_mod_df %>%
+  group_by(tissue, module, module_id) %>%
+  summarise(
+    miRNA_list = paste(sort(unique(sub("^mmu-", "", miRNA_Name))), collapse = ", "),
+    n_miRNAs   = n_distinct(miRNA_Name),
+    .groups    = "drop"
+  )
+
+summary_tbl <- logistic_sig %>%
+  left_join(cluster_coverage, by = c("tissue", "module", "module_id")) %>%
+  left_join(mirna_per_mod,    by = c("tissue", "module", "module_id")) %>%
+  arrange(tissue, p_adj) %>%
+  mutate(across(c(OR, log2OR, CI_lo, CI_hi, p_adj), ~ round(., 4)),
+         linked_to_cluster = !is.na(n_clusters))
+
+cat("=== Enriched modules (OR>1, p_adj<0.05) ===\n")
+summary_tbl %>% print(n = Inf)
+
+write.csv(summary_tbl,
+          file.path(dir_output, "integrated_summary.csv"),
+          row.names = FALSE)
+cat("\nSaved: integrated_summary.csv\n")
+```
+
+# Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

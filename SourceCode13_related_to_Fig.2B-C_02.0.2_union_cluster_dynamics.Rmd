@@ -1,0 +1,830 @@
+---
+title: "Plasma miRNA — mRNA Integration (miRDB ∪ TargetScan, cosine similarity)"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.height = 8, fig.width = 14, dpi = 150)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(ggVennDiagram)
+```
+
+# 2. Parameters
+
+```{r params}
+wd_mirna  <- "F:/wd/cohort7_miRNAs/cohort7_miRNAs"
+wd_mrna   <- "F:/wd/Mm_Bulk_RNA-seq"
+dir_ref   <- "F:/wd/cohort7_miRNAs/ref"
+
+tissues   <- c("hypo", "liver", "panc", "gut", "ewat", "iwat", "bat", "gas", "sol")
+timepoints <- c("0d", "1d", "3d", "1w", "2w", "4w", "6w", "8w", "10w", "12w")
+
+# Time axis in days (for scaling and plotting)
+time_days <- c(0, 1, 3, 7, 14, 28, 42, 56, 70, 84)
+
+# Cosine similarity threshold for negative correlation
+COS_THRESHOLD <- -0.6
+
+# This analysis uses the UNION of miRDB and TargetScan predictions only.
+# No database score filter is applied (the intersection branch has been removed).
+PAIR_SET <- "union"
+
+date_str   <- format(Sys.Date(), "%Y-%m-%d")
+dir_output <- file.path(wd_mirna, "output", "02.0.2_integration_union", date_str)
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory:", dir_output, "\n")
+```
+
+# 3. Helper functions
+
+```{r helpers}
+# Return the latest maSigPro_rsq0.7_d3 directory for a given tissue (mRNA)
+find_masigpro_dir <- function(tissue) {
+  base      <- file.path(wd_mrna, "output", tissue)
+  all_dated <- list.dirs(base, full.names = TRUE, recursive = FALSE)
+  all_dated <- all_dated[grepl("^\\d{4}-\\d{2}-\\d{2}$", basename(all_dated))]
+  all_dated <- sort(all_dated, decreasing = TRUE)
+  for (d in all_dated) {
+    cand <- file.path(d, "maSigPro_rsq0.7_d3")
+    if (dir.exists(cand)) return(cand)
+  }
+  stop(paste("maSigPro_rsq0.7_d3 not found:", tissue))
+}
+
+# Return the latest miRNA maSigPro output directory
+find_mirna_masigpro_dir <- function() {
+  base      <- file.path(wd_mirna, "output", "01_maSigPro")
+  all_dated <- sort(list.dirs(base, full.names = TRUE, recursive = FALSE),
+                    decreasing = TRUE)
+  for (d in all_dated) {
+    if (length(list.files(d, pattern = "^Plasma_miRNA_ids_clst_")) > 0) return(d)
+  }
+  stop("miRNA maSigPro output not found")
+}
+
+# Compute cosine similarity between two numeric vectors
+cosine_sim <- function(x, y) {
+  if (any(is.na(x)) || any(is.na(y))) return(NA_real_)
+  denom <- sqrt(sum(x^2)) * sqrt(sum(y^2))
+  if (denom == 0) return(NA_real_)
+  sum(x * y) / denom
+}
+```
+
+# 4. Load miRNA cluster data
+
+```{r load_mirna_clusters}
+dir_mirna_ms <- find_mirna_masigpro_dir()
+cat("Using miRNA maSigPro dir:", dir_mirna_ms, "\n")
+
+# Load all cluster CSVs and bind
+mirna_clst_df <- lapply(1:5, function(i) {
+  f <- file.path(dir_mirna_ms, paste0("Plasma_miRNA_ids_clst_", i, ".csv"))
+  read.csv(f, stringsAsFactors = FALSE)
+}) %>% bind_rows()
+
+detected_miRNAs <- unique(mirna_clst_df$miRNA_Name)
+cat("Detected miRNAs (maSigPro clusters 1-5):", length(detected_miRNAs), "\n")
+print(table(mirna_clst_df$cluster))
+```
+
+# 5. Load DEG mRNA lists (per tissue)
+
+```{r load_deg_mrna}
+deg_mrna <- setNames(
+  lapply(tissues, function(tis) {
+    dir_ms <- tryCatch(find_masigpro_dir(tis), error = function(e) NULL)
+    if (is.null(dir_ms)) { cat("Skipped:", tis, "\n"); return(NULL) }
+    f <- file.path(dir_ms,
+                   paste0(tis, "_maSigPro_mRNA_rsq0.70_hclust.k4.csv"))
+    if (!file.exists(f)) { cat("CSV not found:", tis, "\n"); return(NULL) }
+    df <- read.csv(f, stringsAsFactors = FALSE)
+    # Handle both row-name and named gene column
+    if ("gene" %in% colnames(df)) df$gene else df$X
+  }),
+  tissues
+)
+
+deg_mrna <- Filter(Negate(is.null), deg_mrna)
+all_deg_symbols <- unique(unlist(deg_mrna))
+
+cat("Tissues loaded:", length(deg_mrna), "\n")
+cat("Total unique DEG symbols:", length(all_deg_symbols), "\n")
+```
+
+# 6. Build miRDB pairs
+
+```{r miRDB_pairs}
+# Load miRDB and filter to detected miRNAs
+miRDB_raw <- read_tsv(
+  file.path(dir_ref, "miRDB_v6.0_prediction_result.txt"),
+  show_col_types = FALSE
+) %>%
+  filter(miRNA_Name %in% detected_miRNAs)
+
+cat("miRDB entries for detected miRNAs:", nrow(miRDB_raw), "\n")
+
+# Convert REFSEQ -> SYMBOL
+refseq_to_symbol <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys    = unique(miRDB_raw$REFSEQ),
+  columns = "SYMBOL",
+  keytype = "REFSEQ"
+) %>%
+  filter(!is.na(SYMBOL)) %>%
+  distinct(REFSEQ, SYMBOL)
+
+miRDB_base <- miRDB_raw %>%
+  left_join(refseq_to_symbol, by = "REFSEQ") %>%
+  filter(!is.na(SYMBOL), SYMBOL %in% all_deg_symbols)
+
+# All pairs (no score filter) — union basis
+miRDB_pairs_all <- miRDB_base %>%
+  distinct(miRNA_Name, SYMBOL) %>%
+  mutate(pair_id = paste(miRNA_Name, SYMBOL, sep = "__"))
+
+cat("miRDB pairs (all):", nrow(miRDB_pairs_all), "\n")
+```
+
+# 7. Build TargetScan pairs
+
+```{r TargetScan_pairs}
+# Use Predicted_Targets_Context_Scores_mmu.txt (individual mmu miRNA names)
+ts_scores <- read_tsv(
+  file.path(dir_ref, "TargetScan_v8.0/mouse/Predicted_Targets_Context_Scores_mmu.txt"),
+  show_col_types = FALSE
+)
+
+ts_base <- ts_scores %>%
+  filter(miRNA %in% detected_miRNAs,
+         `Gene Symbol` %in% all_deg_symbols)
+
+# All pairs (no score filter) — union basis
+TargetScan_pairs_all <- ts_base %>%
+  distinct(miRNA_Name = miRNA, SYMBOL = `Gene Symbol`) %>%
+  mutate(pair_id = paste(miRNA_Name, SYMBOL, sep = "__"))
+
+cat("TargetScan pairs (all):", nrow(TargetScan_pairs_all), "\n")
+```
+
+# 8. Venn diagram: miRDB vs TargetScan
+
+```{r venn_diagram, fig.height=6, fig.width=6}
+# Venn diagram uses unfiltered pairs (union basis)
+venn_list <- list(
+  miRDB      = miRDB_pairs_all$pair_id,
+  TargetScan = TargetScan_pairs_all$pair_id
+)
+
+p_venn <- ggVennDiagram(
+  venn_list,
+  label_alpha = 0,
+  edge_size   = 0.8
+) +
+  scale_fill_gradient(low = "white", high = "#4292c6") +
+  labs(title = "miRNA-mRNA pairs: miRDB vs TargetScan (no score filter)",
+       subtitle = paste("Detected miRNAs (n =", length(detected_miRNAs),
+                        ") × DEG mRNAs (n =", length(all_deg_symbols), ")")) +
+  theme(legend.position = "none")
+
+print(p_venn)
+
+svg(file.path(dir_output, "venn_miRDB_TargetScan.svg"), width = 6, height = 6)
+print(p_venn)
+dev.off()
+cat("Saved: venn_miRDB_TargetScan.svg\n")
+```
+
+# 9. Pair set: union
+
+```{r pair_sets}
+# Union of miRDB and TargetScan predictions (no score filter on either database)
+union_pair_ids <- union(miRDB_pairs_all$pair_id, TargetScan_pairs_all$pair_id)
+cat("Union pairs (no filter):", length(union_pair_ids), "\n")
+
+union_pairs <- bind_rows(miRDB_pairs_all, TargetScan_pairs_all) %>%
+  filter(pair_id %in% union_pair_ids) %>%
+  distinct(miRNA_Name, SYMBOL)
+
+# Expand the pair set by tissue
+union_pairs_tissue <- bind_rows(
+  lapply(names(deg_mrna), function(tis) {
+    union_pairs %>%
+      filter(SYMBOL %in% deg_mrna[[tis]]) %>%
+      mutate(tissue = tis)
+  })
+)
+
+cat("Pairs × tissue (before cosine filter):", nrow(union_pairs_tissue), "\n")
+```
+
+# 10. Scale expression profiles
+
+## 10.1 miRNA: scaled log2(1+TPM) per timepoint
+
+```{r scale_mirna}
+# Load raw miRNA matrix
+data_miRNA_raw <- read.csv(
+  file.path(wd_mirna, "output/data.clean_matrix.csv"),
+  header = TRUE, check.names = FALSE
+) %>%
+  column_to_rownames(var = "miR")
+
+# Outlier samples to exclude
+outlier_samples <- c("1wk_201", "3d_206", "6wk_174", "8wk_234")
+
+mirna_long <- data_miRNA_raw %>%
+  rownames_to_column("miRNA_Name") %>%
+  pivot_longer(-miRNA_Name, names_to = "sample.ID", values_to = "TPM") %>%
+  filter(!sample.ID %in% outlier_samples) %>%
+  mutate(
+    tp_raw  = sub("^(\\w+)_.*", "\\1", sample.ID),
+    # Normalise "1wk","2wk"... -> "1w","2w"... to match mRNA timepoint labels
+    tp_norm = sub("wk$", "w", tp_raw),
+    timepoint = factor(tp_norm, levels = timepoints),
+    log2tpm = log2(1 + TPM)
+  )
+
+# Median per miRNA × timepoint, then scale across timepoints
+mirna_avg <- mirna_long %>%
+  filter(miRNA_Name %in% detected_miRNAs) %>%
+  group_by(miRNA_Name, timepoint) %>%
+  summarise(med = median(log2tpm, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = timepoint, values_from = med) %>%
+  column_to_rownames("miRNA_Name")
+
+# Scale each miRNA profile (z-score across timepoints)
+mirna_scaled <- t(scale(t(mirna_avg), center = TRUE, scale = TRUE))
+mirna_scaled[is.na(mirna_scaled)] <- 0
+
+cat("Scaled miRNA matrix:", nrow(mirna_scaled), "miRNAs x",
+    ncol(mirna_scaled), "timepoints\n")
+```
+
+## 10.2 mRNA: scaled Log2TPM per tissue
+
+```{r scale_mrna}
+mrna_scaled <- setNames(
+  lapply(tissues, function(tis) {
+    dir_ms <- tryCatch(find_masigpro_dir(tis), error = function(e) NULL)
+    if (is.null(dir_ms)) return(NULL)
+
+    # nonzero_Log2TPM.csv is in the dated parent directory
+    dir_parent <- dirname(dir_ms)
+    f <- file.path(dir_parent, paste0(tis, "_nonzero_Log2TPM.csv"))
+    if (!file.exists(f)) return(NULL)
+
+    df <- read.csv(f, stringsAsFactors = FALSE) %>%
+      filter(symbol %in% deg_mrna[[tis]])
+
+    # Timepoint label normalisation (1w/2w... -> 1w/2w...)
+    df <- df %>%
+      mutate(
+        tp_clean = sub(paste0("^", tis, "_"), "", sample.ID),
+        tp_clean = sub("_[0-9]+$", "", tp_clean),
+        tp_clean = factor(tp_clean, levels = timepoints)
+      ) %>%
+      filter(!is.na(tp_clean))
+
+    # Median per symbol × timepoint
+    avg <- df %>%
+      group_by(symbol, tp_clean) %>%
+      summarise(med = median(Log2TPM, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = tp_clean, values_from = med) %>%
+      column_to_rownames("symbol")
+
+    # Keep only timepoints present in data
+    avg <- avg[, colSums(!is.na(avg)) == nrow(avg), drop = FALSE]
+    if (ncol(avg) < 2) return(NULL)
+
+    scaled <- t(scale(t(avg), center = TRUE, scale = TRUE))
+    scaled[is.na(scaled)] <- 0
+    scaled
+  }),
+  tissues
+)
+
+mrna_scaled <- Filter(Negate(is.null), mrna_scaled)
+cat("Tissues with scaled mRNA:", paste(names(mrna_scaled), collapse = ", "), "\n")
+```
+
+# 11. Cosine similarity
+
+```{r cosine_similarity}
+# Compute cosine similarity for a pairs-tissue data frame
+compute_cosine <- function(pairs_tissue_df) {
+  pairs_tissue_df %>%
+    filter(tissue %in% names(mrna_scaled)) %>%
+    rowwise() %>%
+    mutate(
+      cosine = {
+        mir  <- miRNA_Name
+        gene <- SYMBOL
+        tis  <- tissue
+
+        if (!(mir  %in% rownames(mirna_scaled)) ||
+            !(gene %in% rownames(mrna_scaled[[tis]]))) {
+          NA_real_
+        } else {
+          tp_common <- intersect(colnames(mirna_scaled),
+                                 colnames(mrna_scaled[[tis]]))
+          if (length(tp_common) < 3) {
+            NA_real_
+          } else {
+            cosine_sim(
+              as.numeric(mirna_scaled[mir,  tp_common]),
+              as.numeric(mrna_scaled[[tis]][gene, tp_common])
+            )
+          }
+        }
+      }
+    ) %>%
+    ungroup()
+}
+
+cos_result <- compute_cosine(union_pairs_tissue)
+
+cat("Pairs with cosine computed:", sum(!is.na(cos_result$cosine)), "\n")
+cat("\nCosine distribution — union:\n")
+print(summary(cos_result$cosine))
+```
+
+# 12. Filter: cosine < -0.6
+
+```{r filter_negative}
+neg_df <- cos_result %>%
+  filter(!is.na(cosine), cosine < COS_THRESHOLD) %>%
+  left_join(mirna_clst_df %>% distinct(miRNA_Name, cluster),
+            by = "miRNA_Name") %>%
+  dplyr::rename(miRNA_cluster = cluster) %>%
+  mutate(pair_set = PAIR_SET) %>%
+  arrange(cosine)
+
+cat("Negative pairs (cosine <", COS_THRESHOLD, "):", nrow(neg_df), "\n")
+cat("Breakdown by tissue:\n")
+print(table(neg_df$tissue))
+cat("Breakdown by miRNA cluster:\n")
+print(table(neg_df$miRNA_cluster))
+
+dir_set <- file.path(dir_output, PAIR_SET)
+dir.create(dir_set, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(
+  neg_df,
+  file.path(dir_set, paste0("negative_cosine_pairs_", PAIR_SET, ".csv")),
+  row.names = FALSE
+)
+cat("Saved: ", PAIR_SET, "/negative_cosine_pairs_", PAIR_SET, ".csv\n", sep = "")
+```
+
+# 13. Expression dynamics plots
+
+```{r prep_long_data}
+# Build scaled long-format tables for plotting
+
+# Lookup table: timepoint label -> days (0-84)
+tp_to_days <- setNames(time_days, timepoints)
+# e.g. tp_to_days["1w"] = 7, tp_to_days["12w"] = 84
+
+# miRNA long (scaled) — timepoints already normalised to match `timepoints` vector
+mirna_scaled_long <- as.data.frame(mirna_scaled) %>%
+  rownames_to_column("miRNA_Name") %>%
+  pivot_longer(-miRNA_Name, names_to = "timepoint", values_to = "scaled") %>%
+  mutate(
+    timepoint = factor(timepoint, levels = timepoints),
+    time_days = tp_to_days[as.character(timepoint)]   # rescale to 0-84 days
+  )
+
+# mRNA long (scaled), per tissue
+mrna_scaled_long <- bind_rows(
+  lapply(names(mrna_scaled), function(tis) {
+    as.data.frame(mrna_scaled[[tis]]) %>%
+      rownames_to_column("SYMBOL") %>%
+      pivot_longer(-SYMBOL, names_to = "timepoint", values_to = "scaled") %>%
+      mutate(
+        tissue    = tis,
+        timepoint = factor(timepoint, levels = timepoints),
+        time_days = tp_to_days[as.character(timepoint)]   # rescale to 0-84 days
+      )
+  })
+)
+```
+
+```{r dynamics_helper}
+# Color constants
+# Individual lines: desaturated (low saturation) to not compete with fitted curves
+COL_MIRNA_LINE   <- "#d9909a"   # muted pink  — individual miRNA lines
+COL_MIRNA_SMOOTH <- "#d32047"   # vivid red   — miRNA LOESS fitted curve
+COL_MRNA_LINE    <- "#8ab4cc"   # muted steel blue — individual mRNA lines
+COL_MRNA_SMOOTH  <- "#2166ac"   # vivid blue  — mRNA LOESS fitted curve
+
+# Shared plotting function
+# plot_df must have columns: SYMBOL, time_days, scaled, type (miRNA / mRNA)
+make_dynamics_plot <- function(plot_df, title_str, subtitle_str, group_var = "SYMBOL") {
+  ggplot(plot_df,
+         aes(x = time_days, y = scaled, group = .data[[group_var]])) +
+    # mRNA individual lines — muted blue, fixed color (not from aes)
+    geom_line(data = ~filter(., type == "mRNA"),
+              color = COL_MRNA_LINE,
+              alpha = 0.35, linewidth = 0.45) +
+    # mRNA LOESS fitted curve — vivid blue
+    geom_smooth(data = ~filter(., type == "mRNA"),
+                aes(group = 1),
+                method = "loess", se = TRUE,
+                color = COL_MRNA_SMOOTH, fill = "#c6dbef",
+                linewidth = 1.2, linetype = "dashed") +
+    # miRNA individual lines — muted pink, fixed color (not from aes)
+    geom_line(data = ~filter(., type == "miRNA"),
+              color = COL_MIRNA_LINE,
+              linewidth = 0.7, alpha = 0.5) +
+    # miRNA LOESS fitted curve — vivid red
+    geom_smooth(data = ~filter(., type == "miRNA"),
+                aes(group = 1),
+                method = "loess", se = TRUE,
+                color = COL_MIRNA_SMOOTH, fill = "#fcc5c0",
+                linewidth = 1.4) +
+    # Manual legend: show fitted curve colors only
+    scale_color_manual(
+      name   = NULL,
+      values = c("miRNA (fitted)" = COL_MIRNA_SMOOTH,
+                 "mRNA (fitted)"  = COL_MRNA_SMOOTH),
+      guide  = guide_legend(override.aes = list(linewidth = 1.5))
+    ) +
+    scale_x_continuous(
+      breaks = time_days,          # x-axis: 0-84 days
+      labels = timepoints          # labels: "0d","1d",...,"12w"
+    ) +
+    labs(title    = title_str,
+         subtitle = subtitle_str,
+         x = "Duration of HFD feeding (days)",
+         y = "Scaled expression (z-score)") +
+    theme_bw(base_size = 13) +
+    theme(
+      panel.grid   = element_blank(),
+      aspect.ratio = 1,
+      axis.text.x  = element_text(angle = 45, hjust = 1),
+      legend.position = "right"
+    )
+}
+```
+
+```{r stacked_helper}
+# Row labels of the 2 x 5 matrix.
+# Kept short because they are rendered in the rotated right-hand strip.
+PANEL_MIRNA <- "Plasma miRNA"
+PANEL_MRNA  <- "Target mRNA (pooled)"
+
+# Cluster columns are fixed at 1-5 so the layout stays a 2 x 5 matrix even if a
+# cluster carries no negative pair (facet_grid(drop = FALSE) keeps it empty)
+CLUSTER_LEVELS <- paste("Cluster", 1:5)
+
+# 2 (row: miRNA / pooled target mRNA) x 5 (column: miRNA cluster) matrix.
+# facet_grid is used instead of stitching separate plots together so that every
+# panel shares one identical time axis and one identical y scale.
+# stack_df must have columns:
+#   line_id, time_days, scaled, type, panel, cluster_label
+make_stacked_matrix_plot <- function(stack_df, title_str, subtitle_str) {
+
+  ggplot(stack_df, aes(x = time_days, y = scaled, group = line_id)) +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "grey65") +
+    # mRNA individual lines — muted blue (drawn only in the mRNA row)
+    geom_line(data = ~filter(., type == "mRNA"),
+              color = COL_MRNA_LINE,
+              alpha = 0.30, linewidth = 0.45) +
+    # mRNA LOESS fitted curve — vivid blue
+    geom_smooth(data = ~filter(., type == "mRNA"),
+                aes(group = 1),
+                method = "loess", se = TRUE,
+                color = COL_MRNA_SMOOTH, fill = "#c6dbef",
+                linewidth = 1.2, linetype = "dashed") +
+    # miRNA individual lines — muted pink (drawn only in the miRNA row)
+    geom_line(data = ~filter(., type == "miRNA"),
+              color = COL_MIRNA_LINE,
+              linewidth = 0.7, alpha = 0.5) +
+    # miRNA LOESS fitted curve — vivid red
+    geom_smooth(data = ~filter(., type == "miRNA"),
+                aes(group = 1),
+                method = "loess", se = TRUE,
+                color = COL_MIRNA_SMOOTH, fill = "#fcc5c0",
+                linewidth = 1.4) +
+    # Rows = expression type, columns = miRNA cluster.
+    # All scales are shared, so the timepoints line up across every panel.
+    facet_grid(panel ~ cluster_label, drop = FALSE) +
+    scale_x_continuous(breaks = time_days, labels = timepoints) +
+    labs(title    = title_str,
+         subtitle = subtitle_str,
+         x = "Duration of HFD feeding (days)",
+         y = "Scaled expression (z-score)") +
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid       = element_blank(),
+      aspect.ratio     = 1,           # square panels
+      axis.text.x      = element_text(angle = 45, hjust = 1, size = 8),
+      strip.background = element_rect(fill = "grey92"),
+      strip.text       = element_text(face = "bold"),
+      strip.text.y     = element_text(size = 9),
+      legend.position  = "none"
+    )
+}
+```
+
+```{r dynamics_plots, results='asis', fig.height=6, fig.width=14}
+mir_clusters <- sort(unique(neg_df$miRNA_cluster))
+
+for (clst in mir_clusters) {
+
+  cat("\n\n## miRNA Cluster", clst, "\n\n")
+
+  pairs_clst <- neg_df %>% filter(miRNA_cluster == clst)
+  mirs_clst  <- unique(pairs_clst$miRNA_Name)
+
+  # ---- miRNA expression (shared across sub-sections) ----
+  mirna_df_base <- mirna_scaled_long %>%
+    filter(miRNA_Name %in% mirs_clst) %>%
+    dplyr::rename(SYMBOL = miRNA_Name) %>%
+    mutate(type = "miRNA")
+
+  # ================================================================
+  # 13a. Per-tissue plots
+  # ================================================================
+  for (tis in sort(unique(pairs_clst$tissue))) {
+
+    cat("\n### ", tis, "\n\n", sep = "")
+
+    pairs_tis <- pairs_clst %>% filter(tissue == tis)
+
+    mrna_df <- mrna_scaled_long %>%
+      filter(tissue == tis, SYMBOL %in% pairs_tis$SYMBOL) %>%
+      mutate(type = "mRNA")
+
+    plot_df <- bind_rows(
+      mirna_df_base %>% dplyr::select(SYMBOL, time_days, scaled, type),
+      mrna_df       %>% dplyr::select(SYMBOL, time_days, scaled, type)
+    )
+
+    p <- make_dynamics_plot(
+      plot_df,
+      title_str    = paste0("Cluster ", clst, " miRNA vs mRNA — ", tis),
+      subtitle_str = paste0("n = ", n_distinct(pairs_tis$SYMBOL),
+                            " mRNA pairs | cosine < ", COS_THRESHOLD)
+    )
+
+    print(p)
+
+    svg_out <- file.path(dir_set,
+                         paste0("dynamics_", PAIR_SET,
+                                "_clst", clst, "_", tis, ".svg"))
+    svg(svg_out, width = 10, height = 5); print(p); dev.off()
+  }
+
+  # ================================================================
+  # 13b. Cross-tissue combined plot (faceted by tissue)
+  # ================================================================
+  cat("\n### All tissues (combined)\n\n")
+
+  mrna_df_all <- mrna_scaled_long %>%
+    filter(
+      tissue %in% unique(pairs_clst$tissue),
+      SYMBOL %in% unique(pairs_clst$SYMBOL)
+    ) %>%
+    # Keep only (tissue, SYMBOL) pairs that are in neg_df
+    semi_join(pairs_clst %>% dplyr::select(tissue, SYMBOL),
+              by = c("tissue", "SYMBOL")) %>%
+    mutate(type = "mRNA")
+
+  # Replicate miRNA lines into each tissue panel
+  mirna_df_rep <- bind_rows(
+    lapply(sort(unique(pairs_clst$tissue)), function(tis) {
+      mirna_df_base %>% mutate(tissue = tis)
+    })
+  )
+
+  plot_df_all <- bind_rows(
+    mirna_df_rep %>% dplyr::select(SYMBOL, time_days, scaled, type, tissue),
+    mrna_df_all  %>% dplyr::select(SYMBOL, time_days, scaled, type, tissue)
+  )
+
+  n_tis_facet <- n_distinct(plot_df_all$tissue)
+
+  p_all <- ggplot(plot_df_all,
+                  aes(x = time_days, y = scaled, group = SYMBOL)) +
+    # mRNA individual lines — muted blue, fixed color
+    geom_line(data = ~filter(., type == "mRNA"),
+              color = COL_MRNA_LINE,
+              alpha = 0.30, linewidth = 0.45) +
+    # mRNA LOESS fitted curve — vivid blue
+    geom_smooth(data = ~filter(., type == "mRNA"),
+                aes(group = 1),
+                method = "loess", se = TRUE,
+                color = COL_MRNA_SMOOTH, fill = "#c6dbef",
+                linewidth = 1.0, linetype = "dashed") +
+    # miRNA individual lines — muted pink, fixed color
+    geom_line(data = ~filter(., type == "miRNA"),
+              color = COL_MIRNA_LINE,
+              linewidth = 0.7, alpha = 0.5) +
+    # miRNA LOESS fitted curve — vivid red
+    geom_smooth(data = ~filter(., type == "miRNA"),
+                aes(group = 1),
+                method = "loess", se = TRUE,
+                color = COL_MIRNA_SMOOTH, fill = "#fcc5c0",
+                linewidth = 1.1) +
+    # Manual legend: show fitted curve colors only
+    scale_color_manual(
+      name   = NULL,
+      values = c("miRNA (fitted)" = COL_MIRNA_SMOOTH,
+                 "mRNA (fitted)"  = COL_MRNA_SMOOTH),
+      guide  = guide_legend(override.aes = list(linewidth = 1.5))
+    ) +
+    scale_x_continuous(breaks = time_days, labels = timepoints) +
+    facet_wrap(~ tissue, nrow = 2) +
+    labs(
+      title    = paste0("Cluster ", clst, " miRNA vs mRNA — all tissues"),
+      subtitle = paste0("cosine < ", COS_THRESHOLD,
+                        " | n tissues = ", n_tis_facet),
+      x = "Duration of HFD feeding (days)",
+      y = "Scaled expression (z-score)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid   = element_blank(),
+      aspect.ratio = 1,
+      axis.text.x  = element_text(angle = 45, hjust = 1, size = 8),
+      legend.title = element_blank(),
+      strip.background = element_rect(fill = "grey92"),
+      strip.text       = element_text(face = "bold")
+    )
+
+  print(p_all)
+
+  svg_out_all <- file.path(dir_set,
+                           paste0("dynamics_", PAIR_SET,
+                                  "_clst", clst, "_all_tissues.svg"))
+  svg(svg_out_all,
+      width  = 4 * min(n_tis_facet, 5),
+      height = 4 * ceiling(n_tis_facet / 5))
+  print(p_all)
+  dev.off()
+  cat("Saved:", basename(svg_out_all), "\n\n")
+
+  # ================================================================
+  # 13c. All tissues pooled — single panel, no tissue distinction
+  # ================================================================
+  cat("\n### All tissues pooled (no tissue distinction)\n\n")
+
+  # Pool all mRNA from all tissues — each tissue-gene pair is an independent line
+  mrna_df_pool <- mrna_scaled_long %>%
+    filter(
+      tissue %in% unique(pairs_clst$tissue),
+      SYMBOL %in% unique(pairs_clst$SYMBOL)
+    ) %>%
+    semi_join(pairs_clst %>% dplyr::select(tissue, SYMBOL),
+              by = c("tissue", "SYMBOL")) %>%
+    mutate(
+      type       = "mRNA",
+      tissue_gene = paste(tissue, SYMBOL, sep = "-")  # unique id per tissue-gene pair
+    )
+
+  n_pairs <- n_distinct(mrna_df_pool$tissue_gene)   # number of lines (tissue × gene)
+  n_genes <- n_distinct(mrna_df_pool$SYMBOL)        # number of unique genes
+
+  plot_df_pool <- bind_rows(
+    mirna_df_base %>% dplyr::select(SYMBOL, time_days, scaled, type) %>%
+      mutate(tissue_gene = SYMBOL),
+    mrna_df_pool  %>% dplyr::select(tissue_gene, SYMBOL, time_days, scaled, type)
+  )
+
+  p_pool <- make_dynamics_plot(
+    plot_df_pool,
+    title_str    = paste0("Cluster ", clst, " miRNA vs mRNA — all tissues pooled"),
+    subtitle_str = paste0(
+      "lines (tissue-gene pairs) = ", n_pairs, " | ",
+      "unique genes = ", n_genes, " | ",
+      "n tissues = ", n_distinct(mrna_df_pool$tissue), " | ",
+      "cosine < ", COS_THRESHOLD
+    ),
+    group_var = "tissue_gene"
+  )
+
+  print(p_pool)
+
+  svg_out_pool <- file.path(dir_set,
+                            paste0("dynamics_", PAIR_SET,
+                                   "_clst", clst, "_pooled.svg"))
+  svg(svg_out_pool, width = 10, height = 5)
+  print(p_pool)
+  dev.off()
+  cat("Saved:", basename(svg_out_pool), "\n\n")
+
+}  # end cluster loop
+```
+
+# 14. Matrix layout: negatively correlated miRNAs over pooled target mRNAs
+
+A single 2 x 5 matrix of square panels. Top row: the negatively correlated
+miRNAs of each cluster. Bottom row: their target mRNAs pooled across all
+tissues. Columns are miRNA clusters 1-5, so every column is one
+miRNA / target pair sharing the same time axis.
+
+```{r stacked_plots, results='asis', fig.height=8, fig.width=18}
+# Build one long table covering every cluster, tagged with its row (panel) and
+# column (cluster_label) position in the 2 x 5 matrix
+stack_df <- bind_rows(lapply(mir_clusters, function(clst) {
+
+  pairs_clst <- neg_df %>% filter(miRNA_cluster == clst)
+  mirs_clst  <- unique(pairs_clst$miRNA_Name)
+
+  # ---- Top row: miRNAs of this cluster that carry a negative pair ----
+  mirna_df_stack <- mirna_scaled_long %>%
+    filter(miRNA_Name %in% mirs_clst) %>%
+    mutate(
+      type    = "miRNA",
+      panel   = PANEL_MIRNA,
+      SYMBOL  = miRNA_Name,
+      tissue  = NA_character_,
+      # Prefix with the cluster so line ids stay unique across columns
+      line_id = paste0("c", clst, "_", miRNA_Name)
+    )
+
+  # ---- Bottom row: target mRNAs pooled across all tissues ----
+  # Each (tissue, gene) combination is kept as an independent line
+  mrna_df_stack <- mrna_scaled_long %>%
+    filter(
+      tissue %in% unique(pairs_clst$tissue),
+      SYMBOL %in% unique(pairs_clst$SYMBOL)
+    ) %>%
+    semi_join(pairs_clst %>% dplyr::select(tissue, SYMBOL),
+              by = c("tissue", "SYMBOL")) %>%
+    mutate(
+      type    = "mRNA",
+      panel   = PANEL_MRNA,
+      line_id = paste0("c", clst, "_", tissue, "-", SYMBOL)
+    )
+
+  bind_rows(
+    mirna_df_stack %>%
+      dplyr::select(line_id, SYMBOL, tissue, time_days, scaled, type, panel),
+    mrna_df_stack %>%
+      dplyr::select(line_id, SYMBOL, tissue, time_days, scaled, type, panel)
+  ) %>%
+    mutate(cluster_label = paste("Cluster", clst))
+})) %>%
+  mutate(
+    panel         = factor(panel, levels = c(PANEL_MIRNA, PANEL_MRNA)),
+    cluster_label = factor(cluster_label, levels = CLUSTER_LEVELS)
+  )
+
+# Number of lines drawn in each panel of the matrix
+stack_summary <- stack_df %>%
+  group_by(cluster_label, panel) %>%
+  summarise(n_lines = n_distinct(line_id),
+            n_genes = n_distinct(SYMBOL),
+            .groups = "drop")
+
+cat("\nLines per panel:\n")
+print(as.data.frame(stack_summary))
+
+p_matrix <- make_stacked_matrix_plot(
+  stack_df,
+  title_str    = "Negatively correlated miRNAs and their pooled target mRNAs",
+  subtitle_str = paste0(
+    "rows: plasma miRNA / target mRNA pooled across all tissues | ",
+    "columns: miRNA maSigPro cluster | ",
+    "cosine < ", COS_THRESHOLD, " (", PAIR_SET, " pairs)"
+  )
+)
+
+print(p_matrix)
+
+svg_out_matrix <- file.path(
+  dir_set,
+  paste0("matrix_", PAIR_SET, "_miRNA_pooled_mRNA_2x5.svg")
+)
+svg(svg_out_matrix, width = 18, height = 8)
+print(p_matrix)
+dev.off()
+cat("Saved:", basename(svg_out_matrix), "\n\n")
+```
+
+# 15. Session info
+
+```{r sessioninfo}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(dir_output, paste0("sessioninfo_", date_str, ".txt"))
+)
+sessionInfo()
+```

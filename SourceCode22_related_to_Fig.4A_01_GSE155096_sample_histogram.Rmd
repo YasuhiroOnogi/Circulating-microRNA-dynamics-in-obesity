@@ -1,0 +1,271 @@
+---
+title: "GSE155096 MetS microRNA NGS — Per-sample expression histograms"
+author: "Yasuhiro Onogi, Dr."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.height = 4, fig.width = 5, dpi = 150)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+```
+
+# 2. Parameters
+
+```{r params}
+data_path <- "F:/wd/deposit_dataset/GSE155096_MetS_microRNA_NGS.txt/GSE155096_MetS_microRNA_NGS.txt"
+dir_out   <- "F:/wd/cohort7_miRNAs/external validation/output/01_GSE155096"
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+cat("Input :", data_path, "\n")
+cat("Output:", dir_out,   "\n")
+```
+
+# 3. Load data
+
+```{r load}
+raw <- read.delim(data_path, header = TRUE, check.names = FALSE,
+                  stringsAsFactors = FALSE)
+
+# First column = miRNA ID, remaining columns = samples
+id_col   <- colnames(raw)[1]
+samples  <- colnames(raw)[-1]
+
+cat("Rows (miRNAs) :", nrow(raw), "\n")
+cat("Samples       :", length(samples), "\n")
+cat("Sample names  :", paste(samples, collapse = ", "), "\n")
+
+print(head(raw))
+```
+
+# 4. Summary statistics per sample
+
+```{r summary-stats}
+stats_df <- raw %>%
+  pivot_longer(-all_of(id_col), names_to = "sample", values_to = "expr") %>%
+  group_by(sample) %>%
+  summarise(
+    n_features = n(),
+    n_detected  = sum(expr > 0, na.rm = TRUE),
+    mean        = round(mean(expr, na.rm = TRUE), 2),
+    median      = round(median(expr, na.rm = TRUE), 2),
+    sd          = round(sd(expr, na.rm = TRUE), 2),
+    min         = round(min(expr, na.rm = TRUE), 2),
+    max         = round(max(expr, na.rm = TRUE), 2),
+    .groups     = "drop"
+  ) %>%
+  mutate(sample = factor(sample, levels = samples))
+
+print(stats_df)
+
+write.csv(stats_df,
+          file.path(dir_out, "sample_summary_stats.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: sample_summary_stats.csv\n")
+```
+
+# 5. Total counts per sample
+
+```{r total-counts, fig.height=4, fig.width=6}
+total_counts <- raw %>%
+  summarise(across(-all_of(id_col), ~ sum(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "total_counts") %>%
+  mutate(
+    sample = factor(sample, levels = samples),
+    group  = case_when(
+      grepl("^C", sample) ~ "Control",
+      grepl("^T", sample) ~ "Treatment",
+      TRUE                ~ "Other"
+    ),
+    total_counts_M = round(total_counts / 1e6, 3)
+  )
+
+cat("Total counts per sample:\n")
+print(total_counts)
+
+write.csv(total_counts,
+          file.path(dir_out, "sample_total_counts.csv"),
+          row.names = FALSE, quote = TRUE)
+cat("Saved: sample_total_counts.csv\n")
+
+p_total <- ggplot(total_counts,
+                  aes(x = sample, y = total_counts_M, fill = group)) +
+  geom_col(width = 0.65, color = "white", linewidth = 0.3) +
+  geom_text(aes(label = total_counts_M),
+            vjust = -0.4, size = 3.2, fontface = "bold") +
+  scale_fill_manual(values = c("Control" = "#9ecae1",
+                               "Treatment" = "#fc9272",
+                               "Other"     = "#c7c7c7")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "Total counts per sample",
+    subtitle = paste0("Sum of raw counts across all ",
+                      nrow(raw), " miRNA features"),
+    x        = NULL,
+    y        = "Total counts (×10\u2076)",
+    fill     = "Group"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(color = "grey40", hjust = 0.5),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+print(p_total)
+
+ggsave(file.path(dir_out, "total_counts_per_sample.svg"),
+       p_total, width = 6, height = 4)
+ggsave(file.path(dir_out, "total_counts_per_sample.png"),
+       p_total, width = 6, height = 4, dpi = 300)
+cat("Saved: total_counts_per_sample.svg / .png\n")
+```
+
+# 6. Histograms per sample
+
+Raw expression values are right-skewed; histograms are shown on both raw and
+log2(1 + x) scales.
+
+```{r histograms, results='asis', fig.height=4, fig.width=5}
+expr_long <- raw %>%
+  pivot_longer(-all_of(id_col), names_to = "sample", values_to = "expr") %>%
+  mutate(
+    sample   = factor(sample, levels = samples),
+    log2expr = log2(expr + 1)
+  )
+
+for (smp in samples) {
+
+  cat("\n\n## Sample:", smp, "\n\n")
+
+  df_smp <- expr_long %>% filter(sample == smp)
+
+  # ── Raw scale ──────────────────────────────────────────────────────────────
+  p_raw <- ggplot(df_smp, aes(x = expr)) +
+    geom_histogram(bins = 60, fill = "#4292c6", color = "white",
+                   linewidth = 0.2, alpha = 0.85) +
+    scale_x_continuous(labels = scales::comma) +
+    labs(
+      title    = paste0(smp, "  —  raw CPM/RPM"),
+      subtitle = paste0("n = ", nrow(df_smp),
+                        "  |  median = ", median(df_smp$expr, na.rm = TRUE) %>%
+                          round(1),
+                        "  |  max = ", max(df_smp$expr, na.rm = TRUE) %>%
+                          round(1)),
+      x = "Expression (raw)", y = "Count"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(plot.title    = element_text(face = "bold"),
+          plot.subtitle = element_text(color = "grey40", size = 9))
+
+  # ── log2(1+x) scale ────────────────────────────────────────────────────────
+  p_log <- ggplot(df_smp, aes(x = log2expr)) +
+    geom_histogram(bins = 60, fill = "#41ab5d", color = "white",
+                   linewidth = 0.2, alpha = 0.85) +
+    labs(
+      title    = paste0(smp, "  —  log2(1 + x)"),
+      subtitle = paste0("n = ", nrow(df_smp),
+                        "  |  median = ", median(df_smp$log2expr, na.rm = TRUE) %>%
+                          round(2),
+                        "  |  detected (>0) = ",
+                        sum(df_smp$expr > 0, na.rm = TRUE)),
+      x = "log2(1 + expression)", y = "Count"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(plot.title    = element_text(face = "bold"),
+          plot.subtitle = element_text(color = "grey40", size = 9))
+
+  print(p_raw)
+  print(p_log)
+
+  # Save SVG
+  ggsave(file.path(dir_out, paste0("hist_raw_",  smp, ".svg")),
+         p_raw, width = 5, height = 4)
+  ggsave(file.path(dir_out, paste0("hist_log2_", smp, ".svg")),
+         p_log, width = 5, height = 4)
+}
+```
+
+# 6. All samples overlay (log2 scale)
+
+```{r overlay, fig.height=5, fig.width=8}
+# Identify sample group from name prefix (C = control, T = treatment)
+expr_long_grp <- expr_long %>%
+  mutate(group = case_when(
+    grepl("^C", sample) ~ "Control",
+    grepl("^T", sample) ~ "Treatment",
+    TRUE                ~ "Other"
+  ))
+
+p_overlay <- ggplot(expr_long_grp,
+                    aes(x = log2expr, color = sample, linetype = group)) +
+  geom_freqpoly(bins = 60, linewidth = 0.8, alpha = 0.85) +
+  labs(
+    title    = "All samples — log2(1 + x) expression distribution",
+    subtitle = paste0("n features = ", nrow(raw)),
+    x        = "log2(1 + expression)",
+    y        = "Count",
+    color    = "Sample",
+    linetype = "Group"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(color = "grey40", hjust = 0.5),
+    legend.position = "right"
+  )
+
+print(p_overlay)
+
+ggsave(file.path(dir_out, "hist_all_samples_overlay.svg"),
+       p_overlay, width = 8, height = 5)
+ggsave(file.path(dir_out, "hist_all_samples_overlay.png"),
+       p_overlay, width = 8, height = 5, dpi = 300)
+cat("Saved: hist_all_samples_overlay.svg / .png\n")
+```
+
+# 7. Boxplot: expression distribution across samples
+
+```{r boxplot, fig.height=5, fig.width=7}
+p_box <- ggplot(expr_long %>%
+                  mutate(group = case_when(
+                    grepl("^C", sample) ~ "Control",
+                    grepl("^T", sample) ~ "Treatment",
+                    TRUE                ~ "Other"
+                  )),
+                aes(x = sample, y = log2expr, fill = group)) +
+  geom_boxplot(outlier.size = 0.8, outlier.alpha = 0.4,
+               linewidth = 0.5, width = 0.6) +
+  scale_fill_manual(values = c("Control" = "#9ecae1", "Treatment" = "#fc9272",
+                                "Other"   = "#c7c7c7")) +
+  labs(
+    title = "Per-sample expression distribution  [log2(1 + x)]",
+    x     = NULL, y = "log2(1 + expression)", fill = "Group"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+print(p_box)
+
+ggsave(file.path(dir_out, "boxplot_all_samples.svg"),
+       p_box, width = 7, height = 5)
+ggsave(file.path(dir_out, "boxplot_all_samples.png"),
+       p_box, width = 7, height = 5, dpi = 300)
+cat("Saved: boxplot_all_samples.svg / .png\n")
+```
